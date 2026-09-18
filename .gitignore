@@ -1,0 +1,56 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ---- Virtual environments ----
+venv/
+.venv/
+env/
+ENV/
+
+# ---- Environment & secrets ----
+.env
+.env.local
+.env.*.local
+
+# ---- Caches ----
+translate_cache.json
+*.log
+
+# ---- IDE / Editor ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Project outputs (PDF / images / models) ----
+# 测试 PDF 和翻译结果
+*.pdf
+!samples/*.pdf
+# 预览图片
+*.png
+*.jpg
+*.jpeg
+!samples/*.png
+# 大模型文件（几百 MB，不上传）
+*.onnx
+*.gguf
+*.bin
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+
+# ---- Misc ----
+.DS_Store
