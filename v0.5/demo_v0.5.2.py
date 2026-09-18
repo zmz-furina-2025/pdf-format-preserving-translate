@@ -263,7 +263,14 @@ class QwenTranslator:
             if not s:
                 out.append(t)
                 continue
-            prompt = f"Translate the following academic text from English to Chinese. Keep all math symbols, formulas, and abbreviations (like r.v., i.i.d.) unchanged. Output ONLY the Chinese translation, nothing else.\n\nText: {t}"
+            prompt = f"""Translate the following academic text from English to Chinese.
+Rules:
+1. Keep all math formulas wrapped in \\(...\\) LaTeX format. For example: \\(P(X=x)\\), \\(a_1, a_2, \\ldots\\), \\(\\sum_{{i=1}}^n\\).
+2. Do NOT repeat formulas. Translate the text ONCE.
+3. Keep abbreviations like r.v., i.i.d. unchanged.
+4. Output ONLY the Chinese translation, nothing else.
+
+Text: {t}"""
             try:
                 resp = requests.post(
                     f"{self._host}/api/generate",
@@ -290,8 +297,9 @@ class QwenTranslator:
 class VectorPdfTranslator:
     def __init__(self, translate_fn: TranslatorFn, target_lang: str = "zh",
                  use_cache: bool = True, cache_path: str = "translate_cache.json",
-                 use_layout_ai: bool = False):
+                 use_layout_ai: bool = False, render_math: bool = True):
         self._translate = translate_fn
+        self._render_math = render_math
         self.font_out = "china-s" if target_lang == "zh" else "helv"
         # 字宽测量：中文常/粗、英文常/粗 四个 Font
         self._fm_cn = fitz.Font(self.font_out)
@@ -545,15 +553,91 @@ class VectorPdfTranslator:
                 parts.append(line_text.strip())
         return " ".join(parts)
 
-    # ---------- 富文本 token 化：公式符号斜体 + 粗体术语标记 ----------
+    # ---------- LaTeX 公式解析：$...$ 块 → tokens 带 sup/sub flag ----------
     @staticmethod
-    def _tokenize_rich(text: str, bold_terms: List[str],
+    def _parse_latex(text: str) -> List[Tuple[str, int]]:
+        """解析 $...$ LaTeX 块，返回 tokens: (text, flags)
+        flags: bit1=math(斜体), bit2=sup(上标), bit3=sub(下标)
+        """
+        import re as _re
+        tokens: List[Tuple[str, int]] = []
+        # 先按 $$...$$ 或 $...$ 或 \(...\) 拆成普通文本和公式块
+        parts = _re.split(r'(\$\$[^$]+\$\$|\$[^$]+\$|\\\([^\\]+\\\))', text)
+        for part in parts:
+            if not part:
+                continue
+            if part.startswith('$$') and part.endswith('$$'):
+                inner = part[2:-2]
+            elif part.startswith('$') and part.endswith('$'):
+                inner = part[1:-1]
+            elif part.startswith('\\(') and part.endswith('\\)'):
+                inner = part[2:-2]  # 去掉 \( 和 \)
+            else:
+                tokens.append((part, 0))
+                continue
+            # 去掉 \ldots \sum 等命令，保留符号
+            inner = inner.replace(r'\ldots', '...')
+            inner = inner.replace(r'\sum', 'Σ')
+            inner = inner.replace(r'\times', '×')
+            inner = inner.replace(r'\alpha', 'α')
+            inner = inner.replace(r'\beta', 'β')
+            inner = inner.replace(r'\gamma', 'γ')
+            # 求和符号：字号放大
+            inner = inner.replace('Σ', 'Σ')  # 占位，后面渲染时放大
+            # 解析下标 _ 和上标 ^
+            cur = ''
+            cur_flags = 2  # math
+            i = 0
+            while i < len(inner):
+                ch = inner[i]
+                if ch == '_' or ch == '^':
+                    # 先把前面的普通文本输出
+                    if cur:
+                        tokens.append((cur, cur_flags))
+                        cur = ''
+                    # 取下标/上标内容：单个字符或 {..} 块
+                    if i + 1 < len(inner) and inner[i+1] == '{':
+                        j = inner.index('}', i+1)
+                        sub = inner[i+2:j]
+                        i = j
+                    else:
+                        sub = inner[i+1] if i+1 < len(inner) else ''
+                        i += 1
+                    flag = 4 if ch == '^' else 8  # bit2=sup, bit3=sub
+                    tokens.append((sub, 2 | flag))  # math + sup/sub
+                    cur_flags = 2  # 重置为普通 math
+                else:
+                    cur += ch
+                i += 1
+            if cur:
+                tokens.append((cur, cur_flags))
+        return tokens
+
+    # ---------- 富文本 token 化：公式符号斜体 + 粗体术语标记 ----------
+    def _tokenize_rich(self, text: str, bold_terms: List[str],
                        math_symbols: List[str],
                        abbrev_symbols: List[str] = None,
                        sup_symbols: List[str] = None,
                        sub_symbols: List[str] = None) -> List[Tuple[str, int]]:
         # flags: bit0=bold, bit1=math(斜体公式), bit2=sup(上标), bit3=sub(下标)
-        tokens: List[Tuple[str, int]] = [(text, 0)]
+        # 先解析 LaTeX $...$ 块，生成带 math/sup/sub flag 的 tokens
+        if self._render_math:
+            tokens = self._parse_latex(text)
+        else:
+            # 关 render_math 时，识别 \(...\) 公式块和 [[MATH0]] 占位符，标记为 math
+            tokens = []
+            import re as _re_math
+            parts = _re_math.split(r'(\\\([^\\]+\\\)|\[\[MATH\d+\]\])', text)
+            for part in parts:
+                if not part:
+                    continue
+                if part.startswith('\\(') and part.endswith('\\)'):
+                    inner = part[2:-2]  # 去掉 \( 和 \)
+                    tokens.append((inner, 2))  # math flag
+                elif part.startswith('[[MATH') and part.endswith(']]'):
+                    tokens.append((part, 2))  # math flag，渲染时插入 PNG
+                else:
+                    tokens.append((part, 0))
         # 合并 math 和 abbrev，一起标记斜体
         all_symbols = list(math_symbols) + list(abbrev_symbols or [])
         # 1) 在译文中搜索公式/缩写符号，标记 bit1（斜体）
@@ -721,6 +805,29 @@ class VectorPdfTranslator:
         fm = self._fm_cn_b if bold else self._fm_cn
         return fm.text_length(ch, fontsize=fontsize)
 
+    # ---------- LaTeX 公式渲染成 PNG ----------
+    @staticmethod
+    def _render_math_to_png(latex: str, fontsize: float = 12.0) -> tuple:
+        """把 LaTeX 公式渲染成 PNG bytes，返回 (png_bytes, width, height)"""
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            from matplotlib.mathtext import math_to_image
+            import io
+            # 公式包在 $...$ 里
+            buf = io.BytesIO()
+            math_to_image(f'${latex}$', buf, prop=None, dpi=300, format='png')
+            buf.seek(0)
+            png_bytes = buf.read()
+            # 获取图片尺寸
+            from PIL import Image
+            img = Image.open(io.BytesIO(png_bytes))
+            return (png_bytes, img.width, img.height)
+        except Exception as e:
+            print(f"[math render error] {e}")
+            return (None, 0, 0)
+
     def _draw_seg(self, page, x: float, y: float, seg: str,
                   flags: int, fs: float, color, rot: int) -> None:
         if not seg:
@@ -747,8 +854,38 @@ class VectorPdfTranslator:
                     page.insert_text((cur_x, actual_y), part, fontsize=actual_fs, fontname="hebo",
                                      color=color)
             elif math:
-                page.insert_text((cur_x, actual_y), part, fontsize=actual_fs,
-                                 fontname="heit", color=color)
+                # 关 render_math 时，遇到占位符 [[MATH0]]，插入原文 PNG
+                if not self._render_math and part.strip() in self._math_images:
+                    png_bytes, orig_w, orig_h = self._math_images[part.strip()]
+                    # 按当前字号缩放：高度按字号
+                    scale = actual_fs / (orig_h / 300 * 72) if orig_h > 0 else 1.0
+                    new_w = (orig_w / 300 * 72) * scale
+                    new_h = actual_fs
+                    rect = fitz.Rect(cur_x, actual_y - new_h * 0.8,
+                                     cur_x + new_w, actual_y + actual_fs * 0.2)
+                    page.insert_image(rect, stream=png_bytes)
+                    cur_x += new_w
+                    continue
+                # 关 render_math 时，用 matplotlib 渲染 LaTeX 公式成 PNG
+                if not self._render_math:
+                    png_bytes, orig_w, orig_h = self._render_math_to_png(part, actual_fs)
+                    if png_bytes:
+                        # 按当前字号缩放：高度按字号
+                        scale = actual_fs / (orig_h / 300 * 72) if orig_h > 0 else 1.0
+                        new_w = (orig_w / 300 * 72) * scale
+                        new_h = actual_fs
+                        rect = fitz.Rect(cur_x, actual_y - new_h * 0.8,
+                                         cur_x + new_w, actual_y + actual_fs * 0.2)
+                        page.insert_image(rect, stream=png_bytes)
+                        cur_x += new_w
+                        continue
+                # Σ 用 symbol 字体渲染（heit 没有这个字符）
+                if 'Σ' in part:
+                    page.insert_text((cur_x, actual_y), part, fontsize=actual_fs,
+                                     fontname="symbol", color=color)
+                else:
+                    page.insert_text((cur_x, actual_y), part, fontsize=actual_fs,
+                                     fontname="heit", color=color)
             else:
                 if has_cjk:
                     page.insert_text((cur_x, actual_y), part, fontsize=actual_fs,
@@ -826,9 +963,40 @@ class VectorPdfTranslator:
         for i, ab in enumerate(abbrev_set):
             ph = f"[[ABBR{i}]]"
             abbrev_map[ph] = ab
+        # 关 render_math 时，公式也直接保留不翻译：送翻译前替换成占位符
+        math_map = {}
+        math_images = {}  # ph → (png_bytes, orig_w, orig_h)
+        if not self._render_math:
+            math_set = set()
+            for blk in blocks:
+                for ms in blk.math_symbols:
+                    if ms and len(ms) <= 20:  # 只保留短公式
+                        math_set.add(ms)
+            for i, ms in enumerate(math_set):
+                ph = f"[[MATH{i}]]"
+                math_map[ph] = ms
+            # 把原文公式 span 渲染成 PNG（图片级平移）
+            self._math_images = {}
+            for blk in blocks:
+                for line in blk.lines:
+                    for s in line:
+                        if s.is_math and s.text.strip() in math_set:
+                            # 渲染这个 span 区域成 PNG
+                            try:
+                                clip = fitz.Rect(s.bbox)
+                                pix = page.get_pixmap(clip=clip, dpi=300)
+                                png_bytes = pix.tobytes("png")
+                                # key 用占位符，渲染时匹配
+                                ms = s.text.strip()
+                                ph = f"[[MATH{list(math_set).index(ms)}]]"
+                                self._math_images[ph] = (png_bytes, s.bbox[2] - s.bbox[0], s.bbox[3] - s.bbox[1])
+                            except Exception:
+                                pass
         def _apply_abbr(text):
             for ph, ab in abbrev_map.items():
                 text = text.replace(ab, ph)
+            for ph, ms in math_map.items():
+                text = text.replace(ms, ph)
             return text
         def _restore_abbr(text):
             # 翻译 API 可能在占位符中间加空格，模糊匹配
@@ -837,6 +1005,10 @@ class VectorPdfTranslator:
                 # 把 [[ABBR0]] 变成 [[\s*ABBR\s*0\s*]] 模糊匹配
                 pat = _re2.escape(ph).replace(r'\[\[', r'\[\[\s*').replace(r'\]\]', r'\s*\]\]')
                 text = _re2.sub(pat, ab, text)
+            # 公式占位符不换回，渲染时用 PNG 替换
+            for ph, ms in math_map.items():
+                pat = _re2.escape(ph).replace(r'\[\[', r'\[\[\s*').replace(r'\]\]', r'\s*\]\]')
+                text = _re2.sub(pat, ph, text)  # 保留占位符，不换回内容
             return text
         originals = [_apply_abbr(t) for t in originals]
         translated = self._cached_translate(originals)
@@ -845,13 +1017,15 @@ class VectorPdfTranslator:
         # 清理 markdown 残留：去掉 ** ` _ 等多余符号
         import re as _re3
         translated = [_re3.sub(r'\*\*|`', '', t) for t in translated]
-        # 清理 LaTeX 标记：去掉 \( \) \[ \] 包裹，\ldots 换成 ...
-        translated = [_re3.sub(r'\\[\(\)\[\]]', '', t) for t in translated]
+        # 清理 LaTeX 命令（保留 $$...$$ 包裹，让 _parse_latex 识别）
         translated = [t.replace('\\ldots', '...') for t in translated]
         translated = [t.replace('\\times', '×') for t in translated]
         translated = [t.replace('\\alpha', 'α') for t in translated]
         translated = [t.replace('\\beta', 'β') for t in translated]
         translated = [t.replace('\\gamma', 'γ') for t in translated]
+        # 清理 \text{...} 命令，只保留内容
+        import re as _re_text
+        translated = [_re_text.sub(r'\\text\{([^}]*)\}', r'\1', t) for t in translated]
         # 去掉孤立的下划线（不是数字/字母中间的）
         translated = [_re3.sub(r'(?<![a-zA-Z0-9])_(?![a-zA-Z0-9])', '', t) for t in translated]
         # 合并连续单字符之间的多余空格（URL/数字被拆成单字符 span）
@@ -863,6 +1037,16 @@ class VectorPdfTranslator:
                 t = _re3.sub(r'(\S) (?=\S(?: |$))', r'\1', t)
             return t
         translated = [_collapse_spaces(t) for t in translated]
+        # 清理中文之间的多余空格（qwen 经常在公式和中文之间加空格）
+        def _clean_cjk_spaces(t):
+            # 中文字符 + 空格 + 中文字符 → 去掉空格
+            t = _re3.sub(r'([\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])', r'\1', t)
+            # 中文 + 空格 + \( → 去掉空格
+            t = _re3.sub(r'([\u4e00-\u9fff])\s+(?=\\\()', r'\1', t)
+            # \) + 空格 + 中文 → 去掉空格
+            t = _re3.sub(r'(\\\))\s+(?=[\u4e00-\u9fff])', r'\1', t)
+            return t
+        translated = [_clean_cjk_spaces(t) for t in translated]
         # 清理：去掉连续空格，保留正常的词间空格
         translated = [_re.sub(r' {2,}', ' ', t).strip() for t in translated]
         # 把编号前缀拼回译文
@@ -953,6 +1137,7 @@ def main(argv: List[str]) -> int:
     ap.add_argument("--engine", choices=["mock", "tencent", "qwen"], default="mock")
     ap.add_argument("--no-cache", action="store_true", help="禁用翻译缓存")
     ap.add_argument("--layout-ai", action="store_true", help="启用 DocLayout-YOLO 版面检测")
+    ap.add_argument("--no-render-math", action="store_true", help="不重新渲染公式，保留原文公式")
     args = ap.parse_args(argv)
 
     if args.engine == "tencent":
@@ -965,6 +1150,7 @@ def main(argv: List[str]) -> int:
         fn, target_lang=args.dst_lang,
         use_cache=not args.no_cache,
         use_layout_ai=args.layout_ai,
+        render_math=not args.no_render_math,
     )
     tr.run(args.src, args.dst)
     return 0
