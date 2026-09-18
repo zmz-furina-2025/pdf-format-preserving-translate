@@ -82,6 +82,8 @@ class Block:
     has_numbering: bool = False
     # 每行原始完整文本（PyMuPDF 已拼好空格）
     line_texts: List[str] = field(default_factory=list)
+    # 缩写符号（如 r.v., i.i.d.），不翻译，直接保留
+    abbrev_symbols: List[str] = field(default_factory=list)
     # 公式符号原文（{N} 占位符对应的原始 math 文本）
     math_symbols: List[str] = field(default_factory=list)
     # 段落分段：[("text", "英文1"), ("math", "X"), ("text", "英文2"), ...]
@@ -95,6 +97,18 @@ BOLD_CN_FONT = r"C:\Windows\Fonts\msyhbd.ttc"
 BOLD_CN_FONT_FALLBACK = r"C:\Windows\Fonts\simhei.ttf"
 if not os.path.exists(BOLD_CN_FONT):
     BOLD_CN_FONT = BOLD_CN_FONT_FALLBACK
+
+# TODO: 术语表方案（被注释，待换支持 keep 标签的翻译 API 后启用）
+# GLOSSARY = {
+#     "r.v.": "随机变量",
+#     "i.i.d.": "独立同分布",
+#     "p.m.f.": "概率质量函数",
+#     "c.d.f.": "累积分布函数",
+# }
+# _GLOSSARY_MAP = {}
+# for i, (k, v) in enumerate(GLOSSARY.items()):
+#     placeholder = f"⟦TERM{i}⟧"
+#     _GLOSSARY_MAP[placeholder] = (k, v)
 
 
 def _is_cjk(ch: str) -> bool:
@@ -229,11 +243,51 @@ class TencentTranslator:
         return out
 
 
+class QwenTranslator:
+    """本地 Qwen 模型（通过 Ollama HTTP API 调用）。"""
+    def __init__(self, source: str = "en", target: str = "zh",
+                 model: str = "qwen2.5:7b", host: str = "http://localhost:11434"):
+        self._source = source
+        self._target = target
+        self._model = model
+        self._host = host
+
+    def translate_batch(self, texts: Sequence[str]) -> List[str]:
+        import requests
+        out: List[str] = []
+        for t in texts:
+            s = t.strip()
+            if not s:
+                out.append(t)
+                continue
+            prompt = f"Translate the following academic text from English to Chinese. Keep all math symbols, formulas, and abbreviations (like r.v., i.i.d.) unchanged. Output ONLY the Chinese translation, nothing else.\n\nText: {t}"
+            try:
+                resp = requests.post(
+                    f"{self._host}/api/generate",
+                    json={
+                        "model": self._model,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {"temperature": 0.1},
+                    },
+                    timeout=60,
+                )
+                resp.raise_for_status()
+                result = resp.json().get("response", "").strip()
+                out.append(result if result else t)
+            except Exception as e:
+                print(f"[qwen] translation failed: {e}")
+                out.append(t)
+        return out
+
+
 # --------------------------------------------------------------------------- #
 # 核心引擎
 # --------------------------------------------------------------------------- #
 class VectorPdfTranslator:
-    def __init__(self, translate_fn: TranslatorFn, target_lang: str = "zh"):
+    def __init__(self, translate_fn: TranslatorFn, target_lang: str = "zh",
+                 use_cache: bool = True, cache_path: str = "translate_cache.json",
+                 use_layout_ai: bool = False):
         self._translate = translate_fn
         self.font_out = "china-s" if target_lang == "zh" else "helv"
         # 字宽测量：中文常/粗、英文常/粗 四个 Font
@@ -244,6 +298,60 @@ class VectorPdfTranslator:
             self._fm_cn_b = self._fm_cn
         self._fm_en = fitz.Font("helv")
         self._fm_en_b = fitz.Font("hebo")
+        # 翻译缓存
+        self._use_cache = use_cache
+        self._cache_path = cache_path
+        self._cache: dict = {}
+        if use_cache and os.path.exists(cache_path):
+            try:
+                import json
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    self._cache = json.load(f)
+            except Exception:
+                self._cache = {}
+        # 版面 AI 检测（可选，需要装 doclayout-yolo）
+        self._use_layout_ai = use_layout_ai
+        self._layout_model = None
+        if use_layout_ai:
+            try:
+                from doclayout_yolo import YOLOv10
+                model_path = os.path.join(os.path.dirname(__file__),
+                    "doclayout_yolo_docstructbench_imgsz1024.onnx")
+                self._layout_model = YOLOv10(model_path, task="detect")
+                print("[layout-ai] DocLayout-YOLO loaded")
+            except Exception as e:
+                print(f"[layout-ai] 加载失败，回退到坐标聚类: {e}")
+                self._use_layout_ai = False
+
+    def _cached_translate(self, texts: List[str]) -> List[str]:
+        """带缓存的批量翻译"""
+        if not self._use_cache:
+            return self._translate(texts)
+        import hashlib
+        import json
+        out: List[str] = [""] * len(texts)
+        pending_idx: List[int] = []
+        pending_texts: List[str] = []
+        for i, t in enumerate(texts):
+            key = hashlib.md5(t.encode("utf-8")).hexdigest()
+            if key in self._cache:
+                out[i] = self._cache[key]
+            else:
+                pending_idx.append(i)
+                pending_texts.append(t)
+        if pending_texts:
+            results = self._translate(pending_texts)
+            for idx, res in zip(pending_idx, results):
+                out[idx] = res
+                key = hashlib.md5(texts[idx].encode("utf-8")).hexdigest()
+                self._cache[key] = res
+            # 写回缓存
+            try:
+                with open(self._cache_path, "w", encoding="utf-8") as f:
+                    json.dump(self._cache, f, ensure_ascii=False, indent=1)
+            except Exception:
+                pass
+        return out
 
     # ---------- 提取 ----------
     def _collect_blocks(self, page: fitz.Page, m=None) -> List[Block]:
@@ -402,6 +510,10 @@ class VectorPdfTranslator:
                 is_bold = bool(s.flags & 16)
                 if is_bold and s.text.strip() and s.size < 16 and not s.is_math:
                     blk.bold_terms.append(s.text.strip())
+                # 识别缩写：带点的短词（如 r.v. i.i.d. p.m.f.）
+                import re
+                if re.match(r'^[a-zA-Z]\.[a-zA-Z.]*$', s.text.strip()):
+                    blk.abbrev_symbols.append(s.text.strip())
             flush_math()
             if line_text.strip():
                 parts.append(line_text.strip())
@@ -410,13 +522,16 @@ class VectorPdfTranslator:
     # ---------- 富文本 token 化：公式符号斜体 + 粗体术语标记 ----------
     @staticmethod
     def _tokenize_rich(text: str, bold_terms: List[str],
-                       math_symbols: List[str]) -> List[Tuple[str, int]]:
+                       math_symbols: List[str],
+                       abbrev_symbols: List[str] = None) -> List[Tuple[str, int]]:
         # flags: bit0=bold, bit1=math(斜体公式)
         tokens: List[Tuple[str, int]] = [(text, 0)]
-        # 1) 在译文中搜索公式符号，标记 bit1（斜体）
+        # 合并 math 和 abbrev，一起标记斜体
+        all_symbols = list(math_symbols) + list(abbrev_symbols or [])
+        # 1) 在译文中搜索公式/缩写符号，标记 bit1（斜体）
         #    按长度降序，避免短符号先匹配吃掉长符号
         seen = set()
-        for sym in sorted(set(math_symbols), key=len, reverse=True):
+        for sym in sorted(set(all_symbols), key=len, reverse=True):
             if not sym or sym in seen:
                 continue
             seen.add(sym)
@@ -556,8 +671,53 @@ class VectorPdfTranslator:
         if not blocks:
             return 0
 
-        originals = [self._join_block_text(b) for b in blocks]
-        translated = self._translate(originals)
+        originals_raw = [self._join_block_text(b) for b in blocks]
+        # 提取编号前缀（1. 2. ① ② 等不翻译）
+        import re
+        prefixes = []
+        originals = []
+        for t in originals_raw:
+            # 匹配 "1. " "2) " "3、" "① " "② " 等开头
+            m = re.match(r'^(\d+[.\)、:]?\s*|[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮]\s*|[•·]\s*)', t)
+            if m:
+                prefixes.append(m.group(1))
+                originals.append(t[m.end():])
+            else:
+                prefixes.append("")
+                originals.append(t)
+        # 扫描全文：找出所有括号缩写（如 (r.v.)），建哈希表
+        import re as _re
+        abbrev_set = set()
+        for t in originals_raw:
+            # 只匹配短的、带点的学术缩写（如 (r.v.) (i.i.d.)）
+            for m in _re.finditer(r'\([a-zA-Z]+\.[a-zA-Z.]*\)', t):
+                if len(m.group(0)) <= 15:
+                    abbrev_set.add(m.group(0))
+        # 这些缩写直接保留不翻译：送翻译前替换成占位符
+        abbrev_map = {}
+        for i, ab in enumerate(abbrev_set):
+            ph = f"[[ABBR{i}]]"
+            abbrev_map[ph] = ab
+        def _apply_abbr(text):
+            for ph, ab in abbrev_map.items():
+                text = text.replace(ab, ph)
+            return text
+        def _restore_abbr(text):
+            # 翻译 API 可能在占位符中间加空格，模糊匹配
+            import re as _re2
+            for ph, ab in abbrev_map.items():
+                # 把 [[ABBR0]] 变成 [[\s*ABBR\s*0\s*]] 模糊匹配
+                pat = _re2.escape(ph).replace(r'\[\[', r'\[\[\s*').replace(r'\]\]', r'\s*\]\]')
+                text = _re2.sub(pat, ab, text)
+            return text
+        originals = [_apply_abbr(t) for t in originals]
+        translated = self._cached_translate(originals)
+        # 翻译后：占位符换回原文
+        translated = [_restore_abbr(t) for t in translated]
+        # 清理：去掉连续空格，保留正常的词间空格
+        translated = [_re.sub(r' {2,}', ' ', t).strip() for t in translated]
+        # 把编号前缀拼回译文
+        translated = [p + t for p, t in zip(prefixes, translated)]
 
         # 擦除原文
         for b in blocks:
@@ -583,7 +743,7 @@ class VectorPdfTranslator:
         for blk, new_text in zip(blocks, translated):
             if not new_text.strip():
                 continue
-            tokens = self._tokenize_rich(new_text, blk.bold_terms, blk.math_symbols)
+            tokens = self._tokenize_rich(new_text, blk.bold_terms, blk.math_symbols, blk.abbrev_symbols)
             if blk.is_all_bold:
                 tokens = [(t, fl | 1) for t, fl in tokens]
             if not tokens:
@@ -626,18 +786,27 @@ class VectorPdfTranslator:
 # CLI
 # --------------------------------------------------------------------------- #
 def main(argv: List[str]) -> int:
-    ap = argparse.ArgumentParser(description="PDF 段落翻译 v3")
+    ap = argparse.ArgumentParser(description="PDF 段落翻译 v0.3")
     ap.add_argument("src")
     ap.add_argument("dst")
     ap.add_argument("--to", dest="dst_lang", default="zh")
-    ap.add_argument("--engine", choices=["mock", "tencent"], default="mock")
+    ap.add_argument("--engine", choices=["mock", "tencent", "qwen"], default="mock")
+    ap.add_argument("--no-cache", action="store_true", help="禁用翻译缓存")
+    ap.add_argument("--layout-ai", action="store_true", help="启用 DocLayout-YOLO 版面检测")
     args = ap.parse_args(argv)
 
     if args.engine == "tencent":
         fn = TencentTranslator("en", args.dst_lang).translate_batch
+    elif args.engine == "qwen":
+        fn = QwenTranslator("en", args.dst_lang).translate_batch
     else:
         fn = MockTranslator().translate_batch
-    VectorPdfTranslator(fn, target_lang=args.dst_lang).run(args.src, args.dst)
+    tr = VectorPdfTranslator(
+        fn, target_lang=args.dst_lang,
+        use_cache=not args.no_cache,
+        use_layout_ai=args.layout_ai,
+    )
+    tr.run(args.src, args.dst)
     return 0
 
 
