@@ -52,8 +52,14 @@ desktop.ini
 # ---- Jupyter ----
 .ipynb_checkpoints/
 
+# ---- Local scripts ----
+push.bat
+
 # ---- Local history (旧版本本地备份) ----
 .history/
+
+# ---- Test PDFs ----
+.test/
 
 # ---- Misc ----
 .DS_Store
