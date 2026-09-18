@@ -24,7 +24,7 @@
 
 ```bash
 cd src
-python demo_v0.5.1.1.py input.pdf output.pdf --engine qwen
+python demo_v0.5.2.py input.pdf output.pdf --engine qwen
 ```
 
 可选参数：

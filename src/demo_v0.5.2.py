@@ -265,7 +265,7 @@ class QwenTranslator:
                 continue
             prompt = f"""Translate the following academic text from English to Chinese.
 Rules:
-1. Keep all math formulas wrapped in \\(...\\) LaTeX format. For example: \\(P(X=x)\\), \\(a_1, a_2, \\ldots\\), \\(\\sum_{{i=1}}^n\\).
+1. Keep ALL math formulas EXACTLY as they are, wrapped in \\(...\\). Do NOT modify, split, or reorder formulas. For example: \\(\\sum_{{j=1}}^{{\\infty}} p_X(x_j) = 1\\), \\(P(X=x)\\), \\(a_1, a_2, \\ldots\\).
 2. Do NOT repeat formulas. Translate the text ONCE.
 3. Keep abbreviations like r.v., i.i.d. unchanged.
 4. Output ONLY the Chinese translation, nothing else.
@@ -284,6 +284,8 @@ Text: {t}"""
                 )
                 resp.raise_for_status()
                 result = resp.json().get("response", "").strip()
+                print(f"[qwen] in: {s[:60]}")
+                print(f"[qwen] out: {result[:80]}")
                 out.append(result if result else t)
             except Exception as e:
                 print(f"[qwen] translation failed: {e}")
@@ -473,8 +475,8 @@ class VectorPdfTranslator:
         """
         if len(blocks) <= 1:
             return blocks
-        # 按栏（x0 聚类）再按 y0 排序
-        blocks = sorted(blocks, key=lambda b: (round(b.bbox[0] / 20), b.bbox[1]))
+        # 按 y0 排序（从上到下），同一 y 范围内按 x0 排序（从左到右）
+        blocks = sorted(blocks, key=lambda b: (round(b.bbox[1] / 30), b.bbox[0]))
         merged: List[Block] = [blocks[0]]
         for b in blocks[1:]:
             last = merged[-1]
@@ -491,7 +493,10 @@ class VectorPdfTranslator:
             r2, g2, b2 = (c2 >> 16) & 0xFF, (c2 >> 8) & 0xFF, c2 & 0xFF
             same_color = abs(r1-r2) < 30 and abs(g1-g2) < 30 and abs(b1-b2) < 30
             gap = b.bbox[1] - last.bbox[3]
-            close = gap > 0 and gap < last.main_size * 4.0
+            # gap 可能为负（两个 block 上下重叠），但重叠不能太多
+            # 正文里两个行 block 上下重叠一点点（gap ~ -main_size），可以合并
+            # 封面页的居中 block 上下重叠很多（gap ~ -8*main_size），不合并
+            close = -last.main_size * 4.0 < gap < last.main_size * 4.0
             # 调试：打印每个 block 的合并判断
             print(f"  [merge] b='{self._join_block_text(b)[:40]}' "
                   f"same_col={same_col} same_size={same_size}({b.main_size:.1f}vs{last.main_size:.1f}) "
@@ -520,6 +525,8 @@ class VectorPdfTranslator:
     # ---------- 拼接文本（直接拼接 span text，空格 span 自带） ----------
     @staticmethod
     def _join_block_text(blk: Block) -> str:
+        # CMSY 字体字符 → Unicode 符号映射
+        _cmsy_map = {'1': '\u03a3', '2': '\u03a0', '4': '\u222b', '5': '\u222e', '6': '\u22c3', '7': '\u22c2'}
         parts = []
         for line in blk.lines:
             line_text = ""
@@ -531,9 +538,13 @@ class VectorPdfTranslator:
                         blk.math_symbols.append(cur_math.strip())
                     cur_math = ""
             for s in line:
-                line_text += s.text  # span text 自带空格
+                # CMSY 字体的特殊字符映射成 Unicode
+                text = s.text
+                if s.font_name.startswith('CMSY'):
+                    text = ''.join(_cmsy_map.get(c, c) for c in text)
+                line_text += text  # span text 自带空格
                 if s.is_math:
-                    cur_math += s.text
+                    cur_math += text
                 else:
                     flush_math()
                 is_bold = bool(s.flags & 16)
@@ -562,7 +573,7 @@ class VectorPdfTranslator:
         import re as _re
         tokens: List[Tuple[str, int]] = []
         # 先按 $$...$$ 或 $...$ 或 \(...\) 拆成普通文本和公式块
-        parts = _re.split(r'(\$\$[^$]+\$\$|\$[^$]+\$|\\\([^\\]+\\\))', text)
+        parts = _re.split(r'(\$\$.*?\$\$|\$[^$]+\$|\\\(.*?\\\))', text)
         for part in parts:
             if not part:
                 continue
@@ -578,12 +589,34 @@ class VectorPdfTranslator:
             # 去掉 \ldots \sum 等命令，保留符号
             inner = inner.replace(r'\ldots', '...')
             inner = inner.replace(r'\sum', 'Σ')
+            inner = inner.replace(r'\prod', 'Π')
+            inner = inner.replace(r'\infty', '∞')
             inner = inner.replace(r'\times', '×')
             inner = inner.replace(r'\alpha', 'α')
             inner = inner.replace(r'\beta', 'β')
             inner = inner.replace(r'\gamma', 'γ')
-            # 求和符号：字号放大
-            inner = inner.replace('Σ', 'Σ')  # 占位，后面渲染时放大
+            inner = inner.replace(r'\delta', 'δ')
+            inner = inner.replace(r'\pi', 'π')
+            inner = inner.replace(r'\theta', 'θ')
+            inner = inner.replace(r'\lambda', 'λ')
+            inner = inner.replace(r'\mu', 'μ')
+            inner = inner.replace(r'\sigma', 'σ')
+            inner = inner.replace(r'\phi', 'φ')
+            inner = inner.replace(r'\psi', 'ψ')
+            inner = inner.replace(r'\omega', 'ω')
+            inner = inner.replace(r'\Delta', 'Δ')
+            inner = inner.replace(r'\Phi', 'Φ')
+            inner = inner.replace(r'\Psi', 'Ψ')
+            inner = inner.replace(r'\Omega', 'Ω')
+            inner = inner.replace(r'\in', '∈')
+            inner = inner.replace(r'\forall', '∀')
+            inner = inner.replace(r'\exists', '∃')
+            inner = inner.replace(r'\neq', '≠')
+            inner = inner.replace(r'\leq', '≤')
+            inner = inner.replace(r'\geq', '≥')
+            inner = inner.replace(r'\approx', '≈')
+            inner = inner.replace(r'\pm', '±')
+            inner = inner.replace(r'\div', '÷')
             # 解析下标 _ 和上标 ^
             cur = ''
             cur_flags = 2  # math
@@ -624,18 +657,16 @@ class VectorPdfTranslator:
         if self._render_math:
             tokens = self._parse_latex(text)
         else:
-            # 关 render_math 时，识别 \(...\) 公式块和 [[MATH0]] 占位符，标记为 math
+            # 关 render_math 时，识别 \(...\) 公式块，标记为 math（渲染时用 matplotlib）
             tokens = []
             import re as _re_math
-            parts = _re_math.split(r'(\\\([^\\]+\\\)|\[\[MATH\d+\]\])', text)
+            parts = _re_math.split(r'(\\\([^\\]+\\\))', text)
             for part in parts:
                 if not part:
                     continue
                 if part.startswith('\\(') and part.endswith('\\)'):
                     inner = part[2:-2]  # 去掉 \( 和 \)
                     tokens.append((inner, 2))  # math flag
-                elif part.startswith('[[MATH') and part.endswith(']]'):
-                    tokens.append((part, 2))  # math flag，渲染时插入 PNG
                 else:
                     tokens.append((part, 0))
         # 合并 math 和 abbrev，一起标记斜体
@@ -718,10 +749,19 @@ class VectorPdfTranslator:
         return tokens
 
     # ---------- 字宽 ----------
+    _greek_chars = set('Σ∞αβγδπθλμσφψωΔΦΨΩ×÷±∈∀∃')
+    _fm_symbol = None  # 缓存 Segoe UI Symbol 字体
+    def _get_fm_symbol(self):
+        if self._fm_symbol is None:
+            self._fm_symbol = fitz.Font(fontfile=r"C:\Windows\Fonts\seguihis.ttf")
+        return self._fm_symbol
     def _char_width(self, ch: str, flags: int, fontsize: float) -> float:
         bold = bool(flags & 1)
         math = bool(flags & 2)
-        if _is_cjk(ch):
+        if ch in self._greek_chars:
+            fm = self._get_fm_symbol()
+            return fm.text_length(ch, fontsize=fontsize)
+        elif _is_cjk(ch):
             fm = self._fm_cn_b if bold else self._fm_cn
         else:
             if math:
@@ -807,23 +847,27 @@ class VectorPdfTranslator:
 
     # ---------- LaTeX 公式渲染成 PNG ----------
     @staticmethod
-    def _render_math_to_png(latex: str, fontsize: float = 12.0) -> tuple:
-        """把 LaTeX 公式渲染成 PNG bytes，返回 (png_bytes, width, height)"""
+    def _render_math_to_pdf(latex: str, fontsize: float = 12.0) -> tuple:
+        """把 LaTeX 公式渲染成 PDF 矢量 bytes，返回 (pdf_bytes, width, height)"""
         try:
             import matplotlib
             matplotlib.use('Agg')
             import matplotlib.pyplot as plt
-            from matplotlib.mathtext import math_to_image
             import io
-            # 公式包在 $...$ 里
+            # 创建一个临时 figure，只放公式
+            fig = plt.figure(figsize=(0.01, 0.01))
+            fig.text(0, 0, f'${latex}$', fontsize=fontsize)
             buf = io.BytesIO()
-            math_to_image(f'${latex}$', buf, prop=None, dpi=300, format='png')
+            fig.savefig(buf, format='pdf', bbox_inches='tight', pad_inches=0.02)
+            plt.close(fig)
             buf.seek(0)
-            png_bytes = buf.read()
-            # 获取图片尺寸
-            from PIL import Image
-            img = Image.open(io.BytesIO(png_bytes))
-            return (png_bytes, img.width, img.height)
+            pdf_bytes = buf.read()
+            # 获取尺寸（用 PyMuPDF 打开 PDF）
+            import fitz as _fitz
+            doc = _fitz.open("pdf", pdf_bytes)
+            rect = doc[0].rect
+            doc.close()
+            return (pdf_bytes, rect.width, rect.height)
         except Exception as e:
             print(f"[math render error] {e}")
             return (None, 0, 0)
@@ -836,6 +880,7 @@ class VectorPdfTranslator:
         math = bool(flags & 2)
         is_sup = bool(flags & 4)
         is_sub = bool(flags & 8)
+        is_latex = bool(flags & 16)  # 整个公式用 matplotlib 渲染成 PNG
         actual_fs = fs * 0.6 if (is_sup or is_sub) else fs
         actual_y = y - fs * 0.35 if is_sup else (y + fs * 0.2 if is_sub else y)
         # 按中英文拆段：中文用中文字体，英文用英文字体
@@ -854,35 +899,28 @@ class VectorPdfTranslator:
                     page.insert_text((cur_x, actual_y), part, fontsize=actual_fs, fontname="hebo",
                                      color=color)
             elif math:
-                # 关 render_math 时，遇到占位符 [[MATH0]]，插入原文 PNG
-                if not self._render_math and part.strip() in self._math_images:
-                    png_bytes, orig_w, orig_h = self._math_images[part.strip()]
-                    # 按当前字号缩放：高度按字号
-                    scale = actual_fs / (orig_h / 300 * 72) if orig_h > 0 else 1.0
-                    new_w = (orig_w / 300 * 72) * scale
-                    new_h = actual_fs
-                    rect = fitz.Rect(cur_x, actual_y - new_h * 0.8,
-                                     cur_x + new_w, actual_y + actual_fs * 0.2)
-                    page.insert_image(rect, stream=png_bytes)
-                    cur_x += new_w
-                    continue
-                # 关 render_math 时，用 matplotlib 渲染 LaTeX 公式成 PNG
-                if not self._render_math:
-                    png_bytes, orig_w, orig_h = self._render_math_to_png(part, actual_fs)
-                    if png_bytes:
+                # latex 公式：用 matplotlib 渲染成 PDF 矢量图形
+                if is_latex or not self._render_math:
+                    latex_str = seg
+                    pdf_bytes, orig_w, orig_h = self._render_math_to_pdf(latex_str, actual_fs)
+                    if pdf_bytes:
                         # 按当前字号缩放：高度按字号
-                        scale = actual_fs / (orig_h / 300 * 72) if orig_h > 0 else 1.0
-                        new_w = (orig_w / 300 * 72) * scale
+                        scale = actual_fs / orig_h if orig_h > 0 else 1.0
+                        new_w = orig_w * scale
                         new_h = actual_fs
                         rect = fitz.Rect(cur_x, actual_y - new_h * 0.8,
                                          cur_x + new_w, actual_y + actual_fs * 0.2)
-                        page.insert_image(rect, stream=png_bytes)
+                        page.show_pdf_page(rect, fitz.open("pdf", pdf_bytes), 0)
                         cur_x += new_w
                         continue
-                # Σ 用 symbol 字体渲染（heit 没有这个字符）
-                if 'Σ' in part:
+                # 希腊字母和特殊符号用 Segoe UI Symbol 字体渲染（支持所有数学符号）
+                greek_chars = 'Σ∞αβγδπθλμσφψωΔΦΨΩ×÷±∈∀∃'
+                has_greek = any(c in greek_chars for c in part)
+                if has_greek:
+                    font_path = r"C:\Windows\Fonts\seguisym.ttf"  # Segoe UI Symbol
+                    page.insert_font(fontname="seguisym", fontfile=font_path)
                     page.insert_text((cur_x, actual_y), part, fontsize=actual_fs,
-                                     fontname="symbol", color=color)
+                                     fontname="seguisym", color=color)
                 else:
                     page.insert_text((cur_x, actual_y), part, fontsize=actual_fs,
                                      fontname="heit", color=color)
@@ -1005,10 +1043,10 @@ class VectorPdfTranslator:
                 # 把 [[ABBR0]] 变成 [[\s*ABBR\s*0\s*]] 模糊匹配
                 pat = _re2.escape(ph).replace(r'\[\[', r'\[\[\s*').replace(r'\]\]', r'\s*\]\]')
                 text = _re2.sub(pat, ab, text)
-            # 公式占位符不换回，渲染时用 PNG 替换
+            # 公式占位符保留，渲染时用 PNG 替换
             for ph, ms in math_map.items():
                 pat = _re2.escape(ph).replace(r'\[\[', r'\[\[\s*').replace(r'\]\]', r'\s*\]\]')
-                text = _re2.sub(pat, ph, text)  # 保留占位符，不换回内容
+                text = _re2.sub(pat, ph, text)
             return text
         originals = [_apply_abbr(t) for t in originals]
         translated = self._cached_translate(originals)
@@ -1083,7 +1121,7 @@ class VectorPdfTranslator:
             if not tokens:
                 continue
             x0, y0, x1, y1 = blk.bbox
-            max_w = (x1 - x0) * 0.9  # 留 10% 余量，防止测量误差导致溢出
+            max_w = x1 - x0  # 原文宽度，译文尽可能撑满
             n_orig = len(blk.line_baselines)
             single_line = (n_orig == 1)  # 单行 block（标题）不换行
             fit_size, wrapped = self._fit(tokens, max_w, n_orig, blk.main_size,
