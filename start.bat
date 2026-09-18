@@ -1,6 +1,6 @@
 @echo off
 cd /d "%~dp0src"
-echo === PDF Translator v0.5.1.1 ===
+echo === PDF Translator v0.5.2 ===
 
 where python >nul 2>nul || (echo [ERROR] Python not found. Install Python 3.10+ && pause && exit /b 1)
 
