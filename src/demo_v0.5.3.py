@@ -160,15 +160,16 @@ class TencentTranslator:
     SERVICE = "tmt"
     VERSION = "2018-03-21"
 
-    def __init__(self, source: str = "en", target: str = "zh"):
+    def __init__(self, source: str = "en", target: str = "zh",
+                 secret_id: str = None, secret_key: str = None):
         import hashlib
         import hmac
         import time
         self._hmac = hmac
         self._hashlib = hashlib
         self._time = time
-        self._secret_id = os.environ.get("TENCENT_SECRET_ID")
-        self._secret_key = os.environ.get("TENCENT_SECRET_KEY")
+        self._secret_id = secret_id or os.environ.get("TENCENT_SECRET_ID")
+        self._secret_key = secret_key or os.environ.get("TENCENT_SECRET_KEY")
         self._region = os.environ.get("TENCENT_REGION", "ap-shanghai")
         self._source = source
         self._target = target
