@@ -52,5 +52,8 @@ desktop.ini
 # ---- Jupyter ----
 .ipynb_checkpoints/
 
+# ---- Local history (旧版本本地备份) ----
+.history/
+
 # ---- Misc ----
 .DS_Store
