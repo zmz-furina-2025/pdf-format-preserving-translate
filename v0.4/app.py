@@ -1,5 +1,5 @@
 """
-app.py — Gradio 界面版 PDF 翻译 v0.3
+app.py — Gradio 界面版 PDF 翻译 v0.4
 拖入 PDF → 选引擎 → 出译文 PDF。
 
 跑：
@@ -13,9 +13,9 @@ import tempfile
 
 import gradio as gr
 
-# 动态加载 demo_v0.3.1.py（文件名带点，不能直接 import）
+# 动态加载 demo_v0.4.1.py（文件名带点，不能直接 import）
 _spec = importlib.util.spec_from_file_location(
-    "engine", os.path.join(os.path.dirname(__file__), "demo_v0.3.1.py")
+    "engine", os.path.join(os.path.dirname(__file__), "demo_v0.4.1.py")
 )
 _engine_mod = importlib.util.module_from_spec(_spec)
 sys.modules["engine"] = _engine_mod  # dataclass 需要在 sys.modules 里找到模块
@@ -52,8 +52,8 @@ def translate_pdf(pdf_file, engine: str, use_cache: bool, use_layout_ai: bool):
         return None, f"出错：{e}"
 
 
-with gr.Blocks(title="PDF 排版保留翻译 v0.3") as demo:
-    gr.Markdown("# PDF 排版保留翻译 v0.3\n矢量型 PDF，保住多栏 / 粗体 / 色块 / 图片背景。\n新增：翻译缓存、编号前缀保留、DocLayout-YOLO 可选、本地 Qwen 模型。")
+with gr.Blocks(title="PDF 排版保留翻译 v0.4") as demo:
+    gr.Markdown("# PDF 排版保留翻译 v0.4\n矢量型 PDF，保住多栏 / 粗体 / 色块 / 图片背景。\n新增：上下标渲染、DocLayout-YOLO 段落合并障碍物、缩写保留。")
     with gr.Row():
         pdf_in = gr.File(label="上传 PDF", file_types=[".pdf"])
         engine = gr.Radio(["mock", "tencent", "qwen"], value="mock",

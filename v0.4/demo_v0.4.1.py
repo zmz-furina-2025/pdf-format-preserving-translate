@@ -84,6 +84,9 @@ class Block:
     line_texts: List[str] = field(default_factory=list)
     # 缩写符号（如 r.v., i.i.d.），不翻译，直接保留
     abbrev_symbols: List[str] = field(default_factory=list)
+    # 上标/下标字符（如 a₁ 的 1，x² 的 2）
+    sup_symbols: List[str] = field(default_factory=list)
+    sub_symbols: List[str] = field(default_factory=list)
     # 公式符号原文（{N} 占位符对应的原始 math 文本）
     math_symbols: List[str] = field(default_factory=list)
     # 段落分段：[("text", "英文1"), ("math", "X"), ("text", "英文2"), ...]
@@ -246,7 +249,7 @@ class TencentTranslator:
 class QwenTranslator:
     """本地 Qwen 模型（通过 Ollama HTTP API 调用）。"""
     def __init__(self, source: str = "en", target: str = "zh",
-                 model: str = "qwen2.5:7b", host: str = "http://localhost:11434"):
+                 model: str = "qwen2.5:latest", host: str = "http://localhost:11434"):
         self._source = source
         self._target = target
         self._model = model
@@ -298,6 +301,7 @@ class VectorPdfTranslator:
             self._fm_cn_b = self._fm_cn
         self._fm_en = fitz.Font("helv")
         self._fm_en_b = fitz.Font("hebo")
+        self._fm_en_i = fitz.Font("heit")  # 斜体英文字体
         # 翻译缓存
         self._use_cache = use_cache
         self._cache_path = cache_path
@@ -452,12 +456,12 @@ class VectorPdfTranslator:
         return blocks
 
     # ---------- 跨 block 段落合并 ----------
-    @staticmethod
-    def _merge_blocks(blocks: List[Block]) -> List[Block]:
+    def _merge_blocks(self, blocks: List[Block]) -> List[Block]:
         """同栏相邻 block（字号/颜色一致、y 间距正常）合并。
         规则：
           1. 有 bullet 的 block 不与前一个合并（项目符号独立项）
           2. 只在相邻 block 间合并，不跳过中间 block
+          3. 两个 block 之间有 AI 检测到的障碍物（figure/table）时不合并
         """
         if len(blocks) <= 1:
             return blocks
@@ -472,10 +476,27 @@ class VectorPdfTranslator:
                 continue
             same_col = abs(b.bbox[0] - last.bbox[0]) < 30
             same_size = abs(b.main_size - last.main_size) < 3.0
-            same_color = b.main_color == last.main_color
+            # 颜色：放宽判断，RGB 差在 30 以内就算同色（公式 span 可能偏色）
+            c1 = b.main_color
+            c2 = last.main_color
+            r1, g1, b1 = (c1 >> 16) & 0xFF, (c1 >> 8) & 0xFF, c1 & 0xFF
+            r2, g2, b2 = (c2 >> 16) & 0xFF, (c2 >> 8) & 0xFF, c2 & 0xFF
+            same_color = abs(r1-r2) < 30 and abs(g1-g2) < 30 and abs(b1-b2) < 30
             gap = b.bbox[1] - last.bbox[3]
-            close = gap < last.main_size * 4.0
-            if same_col and same_size and same_color and close:
+            close = gap > 0 and gap < last.main_size * 4.0
+            # 调试：打印每个 block 的合并判断
+            print(f"  [merge] b='{self._join_block_text(b)[:40]}' "
+                  f"same_col={same_col} same_size={same_size}({b.main_size:.1f}vs{last.main_size:.1f}) "
+                  f"same_color={same_color} close={close}({gap:.1f}) "
+                  f"bullet={b.has_bullet} num={b.has_numbering}")
+            # 规则3：两个 block 之间有障碍物（figure/table）时不合并
+            has_obstacle = False
+            for obs in self._layout_obstacles:
+                # 障碍物在两个 block 的 y 之间
+                if obs.y0 > last.bbox[3] - 5 and obs.y1 < b.bbox[1] + 5:
+                    has_obstacle = True
+                    break
+            if same_col and same_size and same_color and close and not has_obstacle:
                 last.lines.extend(b.lines)
                 last.line_texts.extend(b.line_texts)
                 last.line_baselines.extend(b.line_baselines)
@@ -514,6 +535,11 @@ class VectorPdfTranslator:
                 import re
                 if re.match(r'^[a-zA-Z]\.[a-zA-Z.]*$', s.text.strip()):
                     blk.abbrev_symbols.append(s.text.strip())
+                # 收集上下标字符
+                if s.is_sup and s.text.strip():
+                    blk.sup_symbols.append(s.text.strip())
+                if s.is_sub and s.text.strip():
+                    blk.sub_symbols.append(s.text.strip())
             flush_math()
             if line_text.strip():
                 parts.append(line_text.strip())
@@ -523,8 +549,10 @@ class VectorPdfTranslator:
     @staticmethod
     def _tokenize_rich(text: str, bold_terms: List[str],
                        math_symbols: List[str],
-                       abbrev_symbols: List[str] = None) -> List[Tuple[str, int]]:
-        # flags: bit0=bold, bit1=math(斜体公式)
+                       abbrev_symbols: List[str] = None,
+                       sup_symbols: List[str] = None,
+                       sub_symbols: List[str] = None) -> List[Tuple[str, int]]:
+        # flags: bit0=bold, bit1=math(斜体公式), bit2=sup(上标), bit3=sub(下标)
         tokens: List[Tuple[str, int]] = [(text, 0)]
         # 合并 math 和 abbrev，一起标记斜体
         all_symbols = list(math_symbols) + list(abbrev_symbols or [])
@@ -545,6 +573,42 @@ class VectorPdfTranslator:
                 if pos > 0:
                     new_tokens.append((t[:pos], fl))
                 new_tokens.append((sym, fl | 2))
+                rest = t[pos + len(sym):]
+                if rest:
+                    new_tokens.append((rest, fl))
+            tokens = new_tokens
+        # 2) 标记上标（bit2）和下标（bit3）
+        #    只匹配单字符数字/字母，避免误匹配
+        for sym in sorted(set(sup_symbols or []), key=len, reverse=True):
+            if not sym or len(sym) > 2:
+                continue
+            new_tokens: List[Tuple[str, int]] = []
+            for t, fl in tokens:
+                if fl & 1 or fl & 2 or fl & 4 or fl & 8:
+                    new_tokens.append((t, fl)); continue
+                pos = t.find(sym)
+                if pos < 0:
+                    new_tokens.append((t, fl)); continue
+                if pos > 0:
+                    new_tokens.append((t[:pos], fl))
+                new_tokens.append((sym, fl | 4))  # bit2 = sup
+                rest = t[pos + len(sym):]
+                if rest:
+                    new_tokens.append((rest, fl))
+            tokens = new_tokens
+        for sym in sorted(set(sub_symbols or []), key=len, reverse=True):
+            if not sym or len(sym) > 2:
+                continue
+            new_tokens: List[Tuple[str, int]] = []
+            for t, fl in tokens:
+                if fl & 1 or fl & 2 or fl & 4 or fl & 8:
+                    new_tokens.append((t, fl)); continue
+                pos = t.find(sym)
+                if pos < 0:
+                    new_tokens.append((t, fl)); continue
+                if pos > 0:
+                    new_tokens.append((t[:pos], fl))
+                new_tokens.append((sym, fl | 8))  # bit3 = sub
                 rest = t[pos + len(sym):]
                 if rest:
                     new_tokens.append((rest, fl))
@@ -572,10 +636,14 @@ class VectorPdfTranslator:
     # ---------- 字宽 ----------
     def _char_width(self, ch: str, flags: int, fontsize: float) -> float:
         bold = bool(flags & 1)
+        math = bool(flags & 2)
         if _is_cjk(ch):
             fm = self._fm_cn_b if bold else self._fm_cn
         else:
-            fm = self._fm_en_b if bold else self._fm_en
+            if math:
+                fm = self._fm_en_i  # 斜体英文字体
+            else:
+                fm = self._fm_en_b if bold else self._fm_en
         return fm.text_length(ch, fontsize=fontsize)
 
     # ---------- 富文本换行（按 token 换行，不拆字符） ----------
@@ -614,18 +682,22 @@ class VectorPdfTranslator:
 
     # ---------- 字号自适应 ----------
     def _fit(self, tokens: List[Tuple[str, int]],
-             max_width: float, n_lines: int, base_size: float
+             max_width: float, n_lines: int, base_size: float,
+             single_line: bool = False
              ) -> Tuple[float, List[List[Tuple[str, int]]]]:
-        # 先试原字号，不行再缩放；下限是原字号的 60%
-        floor = max(7.0, base_size * 0.6)
+        # 先试原字号，不行再缩放；下限是原字号的 40%
+        floor = max(5.0, base_size * 0.4)
         size = base_size
         while size > floor:
             wrapped = self._wrap_rich(tokens, max_width, size)
-            if len(wrapped) <= n_lines * 1.5:
-                return size, wrapped
-            size -= 1.0
+            if single_line:
+                if len(wrapped) == 1:
+                    return size, wrapped
+            else:
+                if len(wrapped) <= n_lines * 1.5:
+                    return size, wrapped
+            size -= 0.5
         wrapped = self._wrap_rich(tokens, max_width, floor)
-        # 不截断，多余的行往下排
         return floor, wrapped
 
     # ---------- 颜色 ----------
@@ -635,37 +707,93 @@ class VectorPdfTranslator:
 
     # ---------- 段落绘制 ----------
     def _seg_width(self, seg: str, flags: int, fs: float) -> float:
-        return sum(self._char_width(ch, flags, fs) for ch in seg)
+        # 中文字符用中文字体，英文字符用英文字体（和渲染一致）
+        total = 0.0
+        for ch in seg:
+            if _is_cjk(ch):
+                total += self._char_width_cjk(ch, flags, fs)
+            else:
+                total += self._char_width(ch, flags, fs)
+        return total
+
+    def _char_width_cjk(self, ch: str, flags: int, fontsize: float) -> float:
+        bold = bool(flags & 1)
+        fm = self._fm_cn_b if bold else self._fm_cn
+        return fm.text_length(ch, fontsize=fontsize)
 
     def _draw_seg(self, page, x: float, y: float, seg: str,
                   flags: int, fs: float, color, rot: int) -> None:
         if not seg:
             return
-        has_cjk = any(_is_cjk(ch) for ch in seg)
         bold = bool(flags & 1)
         math = bool(flags & 2)
-        if bold:
-            if has_cjk:
-                page.insert_text((x, y), seg, fontsize=fs, fontname="F0",
-                                 fontfile=BOLD_CN_FONT, color=color)
+        is_sup = bool(flags & 4)
+        is_sub = bool(flags & 8)
+        actual_fs = fs * 0.6 if (is_sup or is_sub) else fs
+        actual_y = y - fs * 0.35 if is_sup else (y + fs * 0.2 if is_sub else y)
+        # 按中英文拆段：中文用中文字体，英文用英文字体
+        import re as _re_split
+        parts = _re_split.findall(r'([\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]+|[^\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]+)', seg)
+        cur_x = x
+        for part in parts:
+            if not part:
+                continue
+            has_cjk = any(_is_cjk(ch) for ch in part)
+            if bold:
+                if has_cjk:
+                    page.insert_text((cur_x, actual_y), part, fontsize=actual_fs, fontname="F0",
+                                     fontfile=BOLD_CN_FONT, color=color)
+                else:
+                    page.insert_text((cur_x, actual_y), part, fontsize=actual_fs, fontname="hebo",
+                                     color=color)
+            elif math:
+                page.insert_text((cur_x, actual_y), part, fontsize=actual_fs,
+                                 fontname="heit", color=color)
             else:
-                page.insert_text((x, y), seg, fontsize=fs, fontname="hebo",
-                                 color=color)
-        elif math:
-            # 公式符号：用斜体英文字体
-            page.insert_text((x, y), seg, fontsize=fs,
-                             fontname="heit", color=color)
-        else:
-            if has_cjk:
-                page.insert_text((x, y), seg, fontsize=fs,
-                                 fontname=self.font_out, color=color)
-            else:
-                page.insert_text((x, y), seg, fontsize=fs,
-                                 fontname="helv", color=color)
+                if has_cjk:
+                    page.insert_text((cur_x, actual_y), part, fontsize=actual_fs,
+                                     fontname=self.font_out, color=color)
+                else:
+                    page.insert_text((cur_x, actual_y), part, fontsize=actual_fs,
+                                     fontname="helv", color=color)
+            cur_x += self._seg_width(part, flags, actual_fs)
 
     # ---------- 单页 ----------
+    def _detect_layout(self, page: fitz.Page) -> List[fitz.Rect]:
+        """用 DocLayout-YOLO 检测页面版面，返回障碍物 bbox 列表（figure/table 等）"""
+        if not self._layout_model:
+            return []
+        # 渲染页面成图片
+        pix = page.get_pixmap(dpi=150)
+        img_path = os.path.join(os.path.dirname(__file__), "_tmp_layout.png")
+        pix.save(img_path)
+        obstacles = []
+        try:
+            results = self._layout_model.predict(img_path, conf=0.3)
+            for r in results:
+                for box in r.boxes:
+                    cls = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    # DocLayout-YOLO 类别: 0=text, 1=title, 2=figure, 3=table, 4=figure_caption, 5=table_caption
+                    # 障碍物：figure, table
+                    if cls in (2, 3):
+                        x1, y1, x2, y2 = box.xyxy[0].tolist()
+                        # 从图片坐标转 PDF 坐标（dpi=150）
+                        scale = 72.0 / 150.0
+                        obstacles.append(fitz.Rect(x1 * scale, y1 * scale,
+                                                   x2 * scale, y2 * scale))
+        except Exception as e:
+            print(f"[layout-ai] 检测失败: {e}")
+        finally:
+            if os.path.exists(img_path):
+                os.remove(img_path)
+        return obstacles
+
     def translate_page(self, page: fitz.Page) -> int:
         rot = 0
+        # 版面 AI 检测：拿到障碍物列表
+        self._layout_obstacles = self._detect_layout(page) if self._use_layout_ai else []
+        self._page_width = page.rect.width
         raw_blocks = self._collect_blocks(page)
         blocks = self._merge_blocks(raw_blocks)
         if not blocks:
@@ -714,6 +842,27 @@ class VectorPdfTranslator:
         translated = self._cached_translate(originals)
         # 翻译后：占位符换回原文
         translated = [_restore_abbr(t) for t in translated]
+        # 清理 markdown 残留：去掉 ** ` _ 等多余符号
+        import re as _re3
+        translated = [_re3.sub(r'\*\*|`', '', t) for t in translated]
+        # 清理 LaTeX 标记：去掉 \( \) \[ \] 包裹，\ldots 换成 ...
+        translated = [_re3.sub(r'\\[\(\)\[\]]', '', t) for t in translated]
+        translated = [t.replace('\\ldots', '...') for t in translated]
+        translated = [t.replace('\\times', '×') for t in translated]
+        translated = [t.replace('\\alpha', 'α') for t in translated]
+        translated = [t.replace('\\beta', 'β') for t in translated]
+        translated = [t.replace('\\gamma', 'γ') for t in translated]
+        # 去掉孤立的下划线（不是数字/字母中间的）
+        translated = [_re3.sub(r'(?<![a-zA-Z0-9])_(?![a-zA-Z0-9])', '', t) for t in translated]
+        # 合并连续单字符之间的多余空格（URL/数字被拆成单字符 span）
+        def _collapse_spaces(t):
+            prev = None
+            while prev != t:
+                prev = t
+                # 单字符 + 空格 + 单字符 → 去掉空格（包括 : / . 等）
+                t = _re3.sub(r'(\S) (?=\S(?: |$))', r'\1', t)
+            return t
+        translated = [_collapse_spaces(t) for t in translated]
         # 清理：去掉连续空格，保留正常的词间空格
         translated = [_re.sub(r' {2,}', ' ', t).strip() for t in translated]
         # 把编号前缀拼回译文
@@ -743,7 +892,8 @@ class VectorPdfTranslator:
         for blk, new_text in zip(blocks, translated):
             if not new_text.strip():
                 continue
-            tokens = self._tokenize_rich(new_text, blk.bold_terms, blk.math_symbols, blk.abbrev_symbols)
+            tokens = self._tokenize_rich(new_text, blk.bold_terms, blk.math_symbols,
+                                         blk.abbrev_symbols, blk.sup_symbols, blk.sub_symbols)
             if blk.is_all_bold:
                 tokens = [(t, fl | 1) for t, fl in tokens]
             if not tokens:
@@ -751,15 +901,25 @@ class VectorPdfTranslator:
             x0, y0, x1, y1 = blk.bbox
             max_w = (x1 - x0) * 0.9  # 留 10% 余量，防止测量误差导致溢出
             n_orig = len(blk.line_baselines)
-            fit_size, wrapped = self._fit(tokens, max_w, n_orig, blk.main_size)
+            single_line = (n_orig == 1)  # 单行 block（标题）不换行
+            fit_size, wrapped = self._fit(tokens, max_w, n_orig, blk.main_size,
+                                          single_line=single_line)
             color = self._rgb(blk.main_color)
+            # 判断是否居中：block 中心在页面中心 ±5%，且宽度 < 70% 页面宽
+            page_cx = self._page_width / 2
+            blk_cx = (x0 + x1) / 2
+            blk_w = x1 - x0
+            is_centered = (abs(blk_cx - page_cx) < self._page_width * 0.05
+                           and blk_w < self._page_width * 0.7)
             for i, line_tokens in enumerate(wrapped):
-                if i < len(blk.line_baselines):
-                    y = blk.line_baselines[i]
+                # 行距按译文字号算，不用原文 baseline（英文行距太密，中文会重叠）
+                y = blk.line_baselines[0] + i * fit_size * 1.4
+                if is_centered:
+                    # 居中：计算这一行总宽度，从中间开始
+                    line_w = sum(self._seg_width(t, fl, fit_size) for t, fl in line_tokens)
+                    x = page_cx - line_w / 2
                 else:
-                    # 多余的行往下排，行距按字号算
-                    y = blk.line_baselines[-1] + (i - len(blk.line_baselines) + 1) * fit_size * 1.3
-                x = x0
+                    x = x0
                 for text, fl in line_tokens:
                     self._draw_seg(page, x, y, text, fl, fit_size, color, rot)
                     x += self._seg_width(text, fl, fit_size)
