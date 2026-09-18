@@ -28,16 +28,21 @@ import fitz  # PyMuPDF
 # --------------------------------------------------------------------------- #
 # .env
 # --------------------------------------------------------------------------- #
-def _load_env(path: str = ".env") -> None:
-    if not os.path.exists(path):
-        return
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+def _load_env() -> None:
+    # 从当前目录往上找 .env（v0.2/ 子目录跑时能找到根目录的 .env）
+    d = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(4):
+        p = os.path.join(d, ".env")
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip())
+            return
+        d = os.path.dirname(d)
 
 
 _load_env()
@@ -53,6 +58,11 @@ class Span:
     size: float
     color: int
     flags: int = 0  # PyMuPDF span flags，bit4=bold
+    is_math: bool = False  # 公式符号（斜体变量/数学符号），不翻译
+    font_name: str = ""  # 原始字体名
+    origin_y: float = 0.0  # 基线 y 坐标
+    is_sup: bool = False  # 上标
+    is_sub: bool = False  # 下标
 
 
 @dataclass
@@ -66,6 +76,16 @@ class Block:
     bold_terms: List[str] = field(default_factory=list)
     # 整个 block 是否全是粗体（标题/栏目标题）
     is_all_bold: bool = False
+    # 这一行开头有 bullet 圆点（项目符号），是独立项
+    has_bullet: bool = False
+    # 这一行开头有数字编号（1. 2. 3.），是独立项
+    has_numbering: bool = False
+    # 每行原始完整文本（PyMuPDF 已拼好空格）
+    line_texts: List[str] = field(default_factory=list)
+    # 公式符号原文（{N} 占位符对应的原始 math 文本）
+    math_symbols: List[str] = field(default_factory=list)
+    # 段落分段：[("text", "英文1"), ("math", "X"), ("text", "英文2"), ...]
+    segments: List[Tuple[str, str]] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -226,31 +246,73 @@ class VectorPdfTranslator:
         self._fm_en_b = fitz.Font("hebo")
 
     # ---------- 提取 ----------
-    def _collect_blocks(self, page: fitz.Page) -> List[Block]:
+    def _collect_blocks(self, page: fitz.Page, m=None) -> List[Block]:
         blocks: List[Block] = []
+        def T(r):
+            r = fitz.Rect(r)
+            if m == "swap":  # rot=90/270：x/y 互换，竖长条变横长条
+                return fitz.Rect(r.y0, r.x0, r.y1, r.x1)
+            if m:
+                return r * m
+            return r
+        def TP(x, y):
+            if m == "swap":
+                return fitz.Point(y, x)
+            if m:
+                return fitz.Point(x, y) * m
+            return fitz.Point(x, y)
+        # 收集小图片（bullet 圆点）：直径 6-20pt 的独立小图
+        bullet_rects: List[fitz.Rect] = []
+        for info in page.get_image_info():
+            r = fitz.Rect(info["bbox"])
+            w, h = r.width, r.height
+            if 5 <= w <= 25 and 5 <= h <= 25 and abs(w - h) < 5:
+                bullet_rects.append(r)
         for raw in page.get_text("dict")["blocks"]:
             if raw["type"] != 0:
                 continue
-            blk = Block(bbox=tuple(raw["bbox"]))
+            blk = Block(bbox=tuple(T(raw["bbox"])))
             sizes: List[float] = []
             colors: List[int] = []
             for line in raw["lines"]:
                 spans: List[Span] = []
+                line_origins = []
                 for sp in line["spans"]:
                     txt = sp["text"]
-                    if not txt or not txt.strip():
+                    if not txt:
                         continue
+                    fname = sp.get("font", "")
+                    # 手写字（红色手写 OCR 层）：跳过，不翻译不擦
+                    if fname.startswith(".SFUI") or fname.startswith(".PingFang"):
+                        continue
+                    is_math = any(fname.startswith(p) for p in
+                                  ("CMSSI", "CMMI", "CMEX", "CMSY"))
+                    sp_origin_y = float(sp["origin"][1])
                     spans.append(Span(
-                        text=txt, bbox=tuple(sp["bbox"]),
+                        text=txt, bbox=tuple(T(sp["bbox"])),
                         size=float(sp["size"]), color=int(sp["color"]),
                         flags=int(sp["flags"]),
+                        is_math=is_math, font_name=fname,
+                        origin_y=sp_origin_y,
                     ))
+                    line_origins.append((float(sp["size"]), sp_origin_y))
                     sizes.append(float(sp["size"]))
                     colors.append(int(sp["color"]))
+                # 上下标判断：找这行最大字号 span 的 origin 作为基线
+                if line_origins:
+                    main_size = max(s for s, _ in line_origins)
+                    main_origin = [y for s, y in line_origins if s == main_size][0]
+                    for sp in spans:
+                        if sp.size < main_size * 0.8 and sp.text.strip():
+                            if sp.origin_y < main_origin - main_size * 0.1:
+                                sp.is_sup = True
+                            elif sp.origin_y > main_origin + main_size * 0.1:
+                                sp.is_sub = True
                 if spans:
                     blk.lines.append(spans)
-                    # 用该行第一个 span 的真实基线（PyMuPDF span.origin[1]）
-                    blk.line_baselines.append(float(line["spans"][0]["origin"][1]))
+                    blk.line_texts.append(line.get("text", "").strip())
+                    orig = line["spans"][0]["origin"]
+                    blk.line_baselines.append(TP(orig[0], orig[1]).y)
             if not blk.lines:
                 continue
             sizes.sort()
@@ -260,13 +322,35 @@ class VectorPdfTranslator:
             blk.is_all_bold = all(
                 (s.flags & 16) for line in blk.lines for s in line
             ) and len(blk.lines) >= 1
+            # bullet 检测：第一行 y 附近、x0 左边有圆点
+            first_y0 = blk.bbox[1]
+            first_y1 = blk.bbox[3]
+            first_x0 = blk.bbox[0]
+            for br in bullet_rects:
+                # bullet 在文字 block 垂直范围内，且在文字左边或紧邻
+                if br.y1 > first_y0 - 5 and br.y0 < first_y1 + 5:
+                    if br.x1 < first_x0 + 15:  # 在文字左边或紧贴
+                        blk.has_bullet = True
+                        break
+            # 数字编号检测：第一行第一个 span 以数字开头
+            if blk.lines and blk.lines[0]:
+                first_text = blk.lines[0][0].text.strip()
+                if first_text and first_text[0].isdigit():
+                    import re
+                    # 匹配 "1." "2)" "3、" "4:" 或纯 "5xxx" 开头
+                    if re.match(r'^\d+', first_text):
+                        blk.has_numbering = True
             blocks.append(blk)
         return blocks
 
     # ---------- 跨 block 段落合并 ----------
     @staticmethod
     def _merge_blocks(blocks: List[Block]) -> List[Block]:
-        """同栏相邻 block（字号/颜色一致、y 间距正常）合并。"""
+        """同栏相邻 block（字号/颜色一致、y 间距正常）合并。
+        规则：
+          1. 有 bullet 的 block 不与前一个合并（项目符号独立项）
+          2. 只在相邻 block 间合并，不跳过中间 block
+        """
         if len(blocks) <= 1:
             return blocks
         # 按栏（x0 聚类）再按 y0 排序
@@ -274,13 +358,18 @@ class VectorPdfTranslator:
         merged: List[Block] = [blocks[0]]
         for b in blocks[1:]:
             last = merged[-1]
+            # 规则1：有 bullet 或数字编号的 block 独立，不合并
+            if b.has_bullet or b.has_numbering:
+                merged.append(b)
+                continue
             same_col = abs(b.bbox[0] - last.bbox[0]) < 30
-            same_size = abs(b.main_size - last.main_size) < 1.5
+            same_size = abs(b.main_size - last.main_size) < 3.0
             same_color = b.main_color == last.main_color
             gap = b.bbox[1] - last.bbox[3]
-            close = gap < last.main_size * 2.5
+            close = gap < last.main_size * 4.0
             if same_col and same_size and same_color and close:
                 last.lines.extend(b.lines)
+                last.line_texts.extend(b.line_texts)
                 last.line_baselines.extend(b.line_baselines)
                 last.bbox = (
                     min(last.bbox[0], b.bbox[0]), last.bbox[1],
@@ -291,97 +380,177 @@ class VectorPdfTranslator:
                 merged.append(b)
         return merged
 
-    # ---------- 拼接文本（记录粗体术语，不送占位符） ----------
+    # ---------- 拼接文本（直接拼接 span text，空格 span 自带） ----------
     @staticmethod
     def _join_block_text(blk: Block) -> str:
         parts = []
         for line in blk.lines:
-            line_parts = []
+            line_text = ""
+            cur_math = ""
+            def flush_math():
+                nonlocal cur_math
+                if cur_math:
+                    if len(cur_math.strip()) >= 2:
+                        blk.math_symbols.append(cur_math.strip())
+                    cur_math = ""
             for s in line:
-                line_parts.append(s.text)
+                line_text += s.text  # span text 自带空格
+                if s.is_math:
+                    cur_math += s.text
+                else:
+                    flush_math()
                 is_bold = bool(s.flags & 16)
-                # 小字号粗体 span 记为术语，翻译后在译文中搜索标粗
-                if is_bold and s.text.strip() and s.size < 16:
+                if is_bold and s.text.strip() and s.size < 16 and not s.is_math:
                     blk.bold_terms.append(s.text.strip())
-            parts.append("".join(line_parts).strip())
-        return " ".join(p for p in parts if p)
+            flush_math()
+            if line_text.strip():
+                parts.append(line_text.strip())
+        return " ".join(parts)
 
-    # ---------- 富文本 token 化：在译文中搜索粗体术语 ----------
+    # ---------- 富文本 token 化：公式符号斜体 + 粗体术语标记 ----------
     @staticmethod
-    def _tokenize_rich(text: str, bold_terms: List[str]) -> List[Tuple[str, bool]]:
-        tokens: List[Tuple[str, bool]] = [(text, False)]
-        lower_text = text.lower()
+    def _tokenize_rich(text: str, bold_terms: List[str],
+                       math_symbols: List[str]) -> List[Tuple[str, int]]:
+        # flags: bit0=bold, bit1=math(斜体公式)
+        tokens: List[Tuple[str, int]] = [(text, 0)]
+        # 1) 在译文中搜索公式符号，标记 bit1（斜体）
+        #    按长度降序，避免短符号先匹配吃掉长符号
+        seen = set()
+        for sym in sorted(set(math_symbols), key=len, reverse=True):
+            if not sym or sym in seen:
+                continue
+            seen.add(sym)
+            new_tokens: List[Tuple[str, int]] = []
+            for t, fl in tokens:
+                if fl & 1 or fl & 2:
+                    new_tokens.append((t, fl)); continue
+                pos = t.find(sym)
+                if pos < 0:
+                    new_tokens.append((t, fl)); continue
+                if pos > 0:
+                    new_tokens.append((t[:pos], fl))
+                new_tokens.append((sym, fl | 2))
+                rest = t[pos + len(sym):]
+                if rest:
+                    new_tokens.append((rest, fl))
+            tokens = new_tokens
+        # 2) 在译文中搜索粗体术语，标记 bit0
         for term in bold_terms:
             if not term:
                 continue
-            idx = lower_text.find(term.lower())
-            if idx < 0:
-                continue
-            new_tokens: List[Tuple[str, bool]] = []
-            for t, is_b in tokens:
-                if is_b:
-                    new_tokens.append((t, is_b))
-                    continue
+            new_tokens: List[Tuple[str, int]] = []
+            for t, fl in tokens:
+                if fl & 1 or fl & 2:
+                    new_tokens.append((t, fl)); continue
                 pos = t.lower().find(term.lower())
                 if pos < 0:
-                    new_tokens.append((t, is_b))
-                    continue
+                    new_tokens.append((t, fl)); continue
                 if pos > 0:
-                    new_tokens.append((t[:pos], False))
-                new_tokens.append((t[pos : pos + len(term)], True))
-                rest = t[pos + len(term) :]
+                    new_tokens.append((t[:pos], 0))
+                new_tokens.append((t[pos:pos+len(term)], fl | 1))
+                rest = t[pos+len(term):]
                 if rest:
-                    new_tokens.append((rest, False))
+                    new_tokens.append((rest, fl))
             tokens = new_tokens
         return tokens
 
     # ---------- 字宽 ----------
-    def _char_width(self, ch: str, is_bold: bool, fontsize: float) -> float:
+    def _char_width(self, ch: str, flags: int, fontsize: float) -> float:
+        bold = bool(flags & 1)
         if _is_cjk(ch):
-            fm = self._fm_cn_b if is_bold else self._fm_cn
+            fm = self._fm_cn_b if bold else self._fm_cn
         else:
-            fm = self._fm_en_b if is_bold else self._fm_en
+            fm = self._fm_en_b if bold else self._fm_en
         return fm.text_length(ch, fontsize=fontsize)
 
-    # ---------- 富文本换行 ----------
-    def _wrap_rich(self, tokens: List[Tuple[str, bool]],
+    # ---------- 富文本换行（按 token 换行，不拆字符） ----------
+    def _wrap_rich(self, tokens: List[Tuple[str, int]],
                    max_width: float, fontsize: float
-                   ) -> List[List[Tuple[str, bool]]]:
-        lines: List[List[Tuple[str, bool]]] = [[]]
+                   ) -> List[List[Tuple[str, int]]]:
+        lines: List[List[Tuple[str, int]]] = [[]]
         cur_w = 0.0
-        for text, is_bold in tokens:
-            for ch in text:
-                w = self._char_width(ch, is_bold, fontsize)
-                if cur_w + w <= max_width or not lines[-1]:
-                    lines[-1].append((ch, is_bold))
-                    cur_w += w
+        for text, flags in tokens:
+            w = sum(self._char_width(ch, flags, fontsize) for ch in text)
+            if cur_w + w <= max_width or not lines[-1]:
+                # 第一个 token 也可能超宽，逐字符塞
+                if not lines[-1] and w > max_width:
+                    for ch in text:
+                        cw = self._char_width(ch, flags, fontsize)
+                        if cur_w + cw <= max_width or not lines[-1]:
+                            lines[-1].append((ch, flags))
+                            cur_w += cw
+                        else:
+                            lines.append([(ch, flags)])
+                            cur_w = cw
                 else:
-                    lines.append([(ch, is_bold)])
-                    cur_w = w
+                    lines[-1].append((text, flags))
+                    cur_w += w
+            else:
+                # 放不下：逐字符塞，保证不丢字
+                for ch in text:
+                    cw = self._char_width(ch, flags, fontsize)
+                    if cur_w + cw <= max_width:
+                        lines[-1].append((ch, flags))
+                        cur_w += cw
+                    else:
+                        lines.append([(ch, flags)])
+                        cur_w = cw
         return [ln for ln in lines if ln]
 
     # ---------- 字号自适应 ----------
-    def _fit(self, tokens: List[Tuple[str, bool]],
+    def _fit(self, tokens: List[Tuple[str, int]],
              max_width: float, n_lines: int, base_size: float
-             ) -> Tuple[float, List[List[Tuple[str, bool]]]]:
+             ) -> Tuple[float, List[List[Tuple[str, int]]]]:
+        # 先试原字号，不行再缩放；下限是原字号的 60%
+        floor = max(7.0, base_size * 0.6)
         size = base_size
-        while size > 4.0:
+        while size > floor:
             wrapped = self._wrap_rich(tokens, max_width, size)
-            if len(wrapped) <= n_lines:
+            if len(wrapped) <= n_lines * 1.5:
                 return size, wrapped
-            size -= 0.5
-        wrapped = self._wrap_rich(tokens, max_width, 4.0)
-        if len(wrapped) > n_lines:
-            wrapped = wrapped[:n_lines]
-        return 4.0, wrapped
+            size -= 1.0
+        wrapped = self._wrap_rich(tokens, max_width, floor)
+        # 不截断，多余的行往下排
+        return floor, wrapped
 
     # ---------- 颜色 ----------
     @staticmethod
     def _rgb(c: int) -> Tuple[float, float, float]:
         return ((c >> 16 & 255) / 255, (c >> 8 & 255) / 255, (c & 255) / 255)
 
+    # ---------- 段落绘制 ----------
+    def _seg_width(self, seg: str, flags: int, fs: float) -> float:
+        return sum(self._char_width(ch, flags, fs) for ch in seg)
+
+    def _draw_seg(self, page, x: float, y: float, seg: str,
+                  flags: int, fs: float, color, rot: int) -> None:
+        if not seg:
+            return
+        has_cjk = any(_is_cjk(ch) for ch in seg)
+        bold = bool(flags & 1)
+        math = bool(flags & 2)
+        if bold:
+            if has_cjk:
+                page.insert_text((x, y), seg, fontsize=fs, fontname="F0",
+                                 fontfile=BOLD_CN_FONT, color=color)
+            else:
+                page.insert_text((x, y), seg, fontsize=fs, fontname="hebo",
+                                 color=color)
+        elif math:
+            # 公式符号：用斜体英文字体
+            page.insert_text((x, y), seg, fontsize=fs,
+                             fontname="heit", color=color)
+        else:
+            if has_cjk:
+                page.insert_text((x, y), seg, fontsize=fs,
+                                 fontname=self.font_out, color=color)
+            else:
+                page.insert_text((x, y), seg, fontsize=fs,
+                                 fontname="helv", color=color)
+
     # ---------- 单页 ----------
     def translate_page(self, page: fitz.Page) -> int:
+        rot = 0
         raw_blocks = self._collect_blocks(page)
         blocks = self._merge_blocks(raw_blocks)
         if not blocks:
@@ -390,12 +559,17 @@ class VectorPdfTranslator:
         originals = [self._join_block_text(b) for b in blocks]
         translated = self._translate(originals)
 
-        # 擦除：涂白（v0.1 只处理白底纯文字，不支持色块/图片背景）
+        # 擦除原文
         for b in blocks:
             for line in b.lines:
                 for s in line:
-                    page.add_redact_annot(fitz.Rect(s.bbox), fill=(1, 1, 1))
-        for kw in ({"images": fitz.PDF_REDACT_IMAGE_NONE}, {"images": 2}, {}):
+                    page.add_redact_annot(fitz.Rect(s.bbox))
+        for kw in (
+            {"images": fitz.PDF_REDACT_IMAGE_NONE,
+             "graphics": fitz.PDF_REDACT_LINE_ART_NONE},
+            {"images": fitz.PDF_REDACT_IMAGE_NONE},
+            {},
+        ):
             try:
                 page.apply_redactions(**kw)
                 break
@@ -404,19 +578,18 @@ class VectorPdfTranslator:
             except Exception:
                 break
 
-        # 写回（逐字符，粗体用粗体字体）
+        # 写回：整段译文 + 搜索数学表达式标记斜体
         n_written = 0
         for blk, new_text in zip(blocks, translated):
             if not new_text.strip():
                 continue
-            tokens = self._tokenize_rich(new_text, blk.bold_terms)
-            # 整段粗体 block（标题/栏目标题）：所有 token 标粗
+            tokens = self._tokenize_rich(new_text, blk.bold_terms, blk.math_symbols)
             if blk.is_all_bold:
-                tokens = [(t, True) for t, _ in tokens]
+                tokens = [(t, fl | 1) for t, fl in tokens]
             if not tokens:
                 continue
             x0, y0, x1, y1 = blk.bbox
-            max_w = x1 - x0
+            max_w = (x1 - x0) * 0.9  # 留 10% 余量，防止测量误差导致溢出
             n_orig = len(blk.line_baselines)
             fit_size, wrapped = self._fit(tokens, max_w, n_orig, blk.main_size)
             color = self._rgb(blk.main_color)
@@ -424,34 +597,12 @@ class VectorPdfTranslator:
                 if i < len(blk.line_baselines):
                     y = blk.line_baselines[i]
                 else:
-                    y = blk.line_baselines[-1] + (i - len(blk.line_baselines) + 1) * 16
+                    # 多余的行往下排，行距按字号算
+                    y = blk.line_baselines[-1] + (i - len(blk.line_baselines) + 1) * fit_size * 1.3
                 x = x0
-                for ch, is_bold in line_tokens:
-                    # 按字符选字体：粗体中文用雅黑粗，粗体英文用 hebo；
-                    # 常规中文用 china-s，常规英文用 helv
-                    if is_bold:
-                        if _is_cjk(ch):
-                            page.insert_text(
-                                (x, y), ch, fontsize=fit_size,
-                                fontname="F0", fontfile=BOLD_CN_FONT, color=color,
-                            )
-                        else:
-                            page.insert_text(
-                                (x, y), ch, fontsize=fit_size,
-                                fontname="hebo", color=color,
-                            )
-                    else:
-                        if _is_cjk(ch):
-                            page.insert_text(
-                                (x, y), ch, fontsize=fit_size,
-                                fontname=self.font_out, color=color,
-                            )
-                        else:
-                            page.insert_text(
-                                (x, y), ch, fontsize=fit_size,
-                                fontname="helv", color=color,
-                            )
-                    x += self._char_width(ch, is_bold, fit_size)
+                for text, fl in line_tokens:
+                    self._draw_seg(page, x, y, text, fl, fit_size, color, rot)
+                    x += self._seg_width(text, fl, fit_size)
                 n_written += 1
         return n_written
 
@@ -461,6 +612,10 @@ class VectorPdfTranslator:
         n_pages = doc.page_count
         total = 0
         for page in doc:
+            # rotation != 0 的页：清零 rotation，让 dict 坐标和 insert_text 坐标系一致；
+            # 不恢复 rotation，输出就是字正的（页面可能变纵向，但字方向对）。
+            if page.rotation:
+                page.set_rotation(0)
             total += self.translate_page(page)
         doc.save(dst, garbage=3, deflate=True)
         doc.close()
