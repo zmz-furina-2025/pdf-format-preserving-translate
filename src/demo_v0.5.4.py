@@ -1,4 +1,4 @@
-"""
+﻿"""
 pdf-translate-demo / demo.py 
 
 流程：
@@ -16,7 +16,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence, Tuple
 
-import fitz  # PyMuPDF
+import pymupdf as fitz  # PyMuPDF
 
 
 # --------------------------------------------------------------------------- #
@@ -167,6 +167,7 @@ class TencentTranslator:
         self._region = os.environ.get("TENCENT_REGION", "ap-shanghai")
         self._source = source
         self._target = target
+        self._last_call = 0  # 上次调用时间，用于限流
         if not self._secret_id or not self._secret_key:
             raise RuntimeError("缺少 TENCENT_SECRET_ID / TENCENT_SECRET_KEY")
 
@@ -176,6 +177,11 @@ class TencentTranslator:
     def _call(self, action: str, payload: dict) -> dict:
         import json
         import requests
+        # 限流：上次调用到现在至少 0.2 秒（每秒最多 5 次）
+        elapsed = self._time.time() - self._last_call
+        if elapsed < 0.2:
+            self._time.sleep(0.2 - elapsed)
+        self._last_call = self._time.time()
         timestamp = int(self._time.time())
         date = self._time.strftime("%Y-%m-%d", self._time.gmtime(timestamp))
         body = json.dumps(payload)
@@ -459,6 +465,11 @@ class VectorPdfTranslator:
                     # 匹配 "1." "2)" "3、" "4:" 或纯 "5xxx" 开头
                     if re.match(r'^\d+', first_text):
                         blk.has_numbering = True
+            # 文字 bullet 检测：第一行以 – / - / • / · 开头的，算 bullet
+            if blk.lines and blk.lines[0]:
+                first_text = blk.lines[0][0].text.strip()
+                if first_text and first_text[0] in '–-•··':
+                    blk.has_bullet = True
             blocks.append(blk)
         return blocks
 
@@ -479,6 +490,10 @@ class VectorPdfTranslator:
             last = merged[-1]
             # 规则1：有 bullet 或数字编号的 block 独立，不合并
             if b.has_bullet or b.has_numbering:
+                merged.append(b)
+                continue
+            # 规则1.5：缩进的 block（x0 比上一个大超过 15pt），独立不合并
+            if b.bbox[0] - last.bbox[0] > 15:
                 merged.append(b)
                 continue
             same_col = abs(b.bbox[0] - last.bbox[0]) < 30
@@ -860,7 +875,7 @@ class VectorPdfTranslator:
             buf.seek(0)
             pdf_bytes = buf.read()
             # 获取尺寸（用 PyMuPDF 打开 PDF）
-            import fitz as _fitz
+            import pymupdf as _fitz
             doc = _fitz.open("pdf", pdf_bytes)
             rect = doc[0].rect
             doc.close()
@@ -1225,3 +1240,4 @@ def main(argv: List[str]) -> int:
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
+

@@ -60,6 +60,9 @@ def translate_pdf(pdf_file, engine: str, use_cache: bool, use_layout_ai: bool, r
         return
 
     src = pdf_file.name
+    # 译文文件名：把原文件名翻译成中文
+    src_basename = os.path.basename(src)
+    name, ext = os.path.splitext(src_basename)
     tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
     dst = tmp.name
     tmp.close()
@@ -74,11 +77,26 @@ def translate_pdf(pdf_file, engine: str, use_cache: bool, use_layout_ai: bool, r
                     return
                 # 存到 .env
                 save_env(secret_id, secret_key)
-                fn = TencentTranslator("en", "zh", secret_id=secret_id, secret_key=secret_key).translate_batch
+                translator = TencentTranslator("en", "zh", secret_id=secret_id, secret_key=secret_key)
+                fn = translator.translate_batch
+                # 翻译文件名
+                try:
+                    translated_name = translator.translate_batch([name])[0]
+                    dst_filename = f"{translated_name}{ext}"
+                except Exception:
+                    dst_filename = f"{name}_译文{ext}"
             elif engine == "qwen":
-                fn = QwenTranslator("en", "zh", host=qwen_host, model=qwen_model).translate_batch
+                translator = QwenTranslator("en", "zh", host=qwen_host, model=qwen_model)
+                fn = translator.translate_batch
+                # 翻译文件名
+                try:
+                    translated_name = translator.translate_batch([name])[0]
+                    dst_filename = f"{translated_name}{ext}"
+                except Exception:
+                    dst_filename = f"{name}_译文{ext}"
             else:
                 fn = MockTranslator().translate_batch
+                dst_filename = f"{name}_译文{ext}"
             tr = VectorPdfTranslator(
                 fn, target_lang="zh",
                 use_cache=use_cache,
@@ -88,7 +106,11 @@ def translate_pdf(pdf_file, engine: str, use_cache: bool, use_layout_ai: bool, r
             def cb(msg):
                 q.put(("progress", msg))
             tr.run(src, dst, progress_callback=cb)
-            q.put(("done", dst))
+            # 重命名成原文件名_译文.pdf
+            final_dst = os.path.join(tempfile.gettempdir(), dst_filename)
+            import shutil
+            shutil.copy(dst, final_dst)
+            q.put(("done", final_dst))
         except Exception as e:
             q.put(("error", f"出错：{e}"))
 

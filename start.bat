@@ -4,7 +4,7 @@ echo === PDF Translator v0.5.4 ===
 
 where python >nul 2>nul || (echo [ERROR] Python not found. Install Python 3.10+ && pause && exit /b 1)
 
-python -c "import gradio, fitz" 2>nul
+python -c "import gradio, pymupdf" 2>nul
 if errorlevel 1 (
     echo [INFO] First run, installing dependencies...
     python -m pip install --quiet gradio pymupdf requests
