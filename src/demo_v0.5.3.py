@@ -1,11 +1,5 @@
 """
-pdf-translate-demo / demo.py  (v3: 段落连续性 + 粗体保留)
-=========================================================
-相对 v2 的升级：
-  1. 跨 block 段落合并：同栏相邻 block（字号/颜色一致、y 间距正常）
-     自动拼成一段送翻译，解决"同一段落被 PDF 拆成两个 block"。
-  2. 粗体保留：block 内的粗体 span 用 ⟦N⟧ 占位符替换，送翻译后
-     解析占位符，粗体部分用雅黑粗体渲染。
+pdf-translate-demo / demo.py 
 
 流程：
   get_text("dict") → 取 span(含 flags) → 同栏合并 block → 粗体替换成占位符

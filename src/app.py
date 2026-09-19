@@ -60,11 +60,11 @@ def translate_pdf(pdf_file, engine: str, use_cache: bool, use_layout_ai: bool, r
 # ---- 引擎选择时显示/隐藏配置 ----
 def on_engine_change(engine: str):
     if engine == "tencent":
-        return gr.update(visible=True), gr.update(visible=False), gr.update(visible=False)
+        return gr.update(visible=True), gr.update(visible=False)
     elif engine == "qwen":
-        return gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
+        return gr.update(visible=False), gr.update(visible=True)
     else:
-        return gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
+        return gr.update(visible=False), gr.update(visible=False)
 
 
 with gr.Blocks(title="PDF 排版保留翻译 v0.5.3") as demo:
