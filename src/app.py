@@ -37,11 +37,11 @@ def translate_pdf(pdf_file, engine: str, use_cache: bool, use_layout_ai: bool, r
     dst = tmp.name
     tmp.close()
     try:
-        if engine == "tencent":
+        if engine == "云端翻译 API":
             if not secret_id or not secret_key:
                 return None, "请先填 SecretId 和 SecretKey"
             fn = TencentTranslator("en", "zh", secret_id=secret_id, secret_key=secret_key).translate_batch
-        elif engine == "qwen":
+        elif engine == "本地 qwen 小模型":
             fn = QwenTranslator("en", "zh", host=qwen_host, model=qwen_model).translate_batch
         else:
             fn = MockTranslator().translate_batch
@@ -59,9 +59,9 @@ def translate_pdf(pdf_file, engine: str, use_cache: bool, use_layout_ai: bool, r
 
 # ---- 引擎选择时显示/隐藏配置 ----
 def on_engine_change(engine: str):
-    if engine == "tencent":
+    if engine == "云端翻译 API":
         return gr.update(visible=True), gr.update(visible=False)
-    elif engine == "qwen":
+    elif engine == "本地 qwen 小模型":
         return gr.update(visible=False), gr.update(visible=True)
     else:
         return gr.update(visible=False), gr.update(visible=False)
@@ -72,10 +72,9 @@ with gr.Blocks(title="PDF 排版保留翻译 v0.5.3") as demo:
     with gr.Row():
         pdf_in = gr.File(label="上传 PDF", file_types=[".pdf"])
         engine = gr.Radio(
-            ["mock", "云端翻译 API", "本地 qwen 小模型"],
+            [("Mock（伪翻译不花钱）", "mock"), ("云端翻译 API（快）", "tencent"), ("本地 qwen（离线高质量）", "qwen")],
             value="mock",
             label="翻译引擎",
-            info="mock=伪翻译不花钱，云端翻译 API=快，本地 qwen=离线高质量"
         )
 
     # ---- 云端 API 配置（选云端翻译 API 时显示）----
