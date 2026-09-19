@@ -311,6 +311,8 @@ class VectorPdfTranslator:
         self._use_cache = use_cache
         self._cache_path = cache_path
         self._cache: dict = {}
+        # 版面障碍物（每页面会在 translate_page 里更新）
+        self._layout_obstacles = []
         if use_cache and os.path.exists(cache_path):
             try:
                 import json
@@ -492,11 +494,11 @@ class VectorPdfTranslator:
             # 正文里两个行 block 上下重叠一点点（gap ~ -main_size），可以合并
             # 封面页的居中 block 上下重叠很多（gap ~ -8*main_size），不合并
             close = -last.main_size * 4.0 < gap < last.main_size * 4.0
-            # 调试：打印每个 block 的合并判断
-            print(f"  [merge] b='{self._join_block_text(b)[:40]}' "
-                  f"same_col={same_col} same_size={same_size}({b.main_size:.1f}vs{last.main_size:.1f}) "
-                  f"same_color={same_color} close={close}({gap:.1f}) "
-                  f"bullet={b.has_bullet} num={b.has_numbering}")
+            # 调试：打印每个 block 的合并判断（已关闭）
+            # print(f"  [merge] b='{self._join_block_text(b)[:40]}' "
+            #       f"same_col={same_col} same_size={same_size}({b.main_size:.1f}vs{last.main_size:.1f}) "
+            #       f"same_color={same_color} close={close}({gap:.1f}) "
+            #       f"bullet={b.has_bullet} num={b.has_numbering}")
             # 规则3：两个 block 之间有障碍物（figure/table）时不合并
             has_obstacle = False
             for obs in self._layout_obstacles:
