@@ -32,16 +32,17 @@ def translate_pdf(pdf_file, engine: str, use_cache: bool, use_layout_ai: bool, r
                   qwen_host: str, qwen_model: str):
     if pdf_file is None:
         return None, "请先上传 PDF"
+    print(f"[DEBUG] engine={engine!r}, qwen_model={qwen_model!r}")
     src = pdf_file.name
     tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
     dst = tmp.name
     tmp.close()
     try:
-        if engine == "云端翻译 API":
+        if engine == "tencent":
             if not secret_id or not secret_key:
                 return None, "请先填 SecretId 和 SecretKey"
             fn = TencentTranslator("en", "zh", secret_id=secret_id, secret_key=secret_key).translate_batch
-        elif engine == "本地 qwen 小模型":
+        elif engine == "qwen":
             fn = QwenTranslator("en", "zh", host=qwen_host, model=qwen_model).translate_batch
         else:
             fn = MockTranslator().translate_batch
@@ -59,9 +60,9 @@ def translate_pdf(pdf_file, engine: str, use_cache: bool, use_layout_ai: bool, r
 
 # ---- 引擎选择时显示/隐藏配置 ----
 def on_engine_change(engine: str):
-    if engine == "云端翻译 API":
+    if engine == "tencent":
         return gr.update(visible=True), gr.update(visible=False)
-    elif engine == "本地 qwen 小模型":
+    elif engine == "qwen":
         return gr.update(visible=False), gr.update(visible=True)
     else:
         return gr.update(visible=False), gr.update(visible=False)
