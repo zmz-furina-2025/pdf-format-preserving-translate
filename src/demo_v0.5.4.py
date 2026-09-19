@@ -1145,18 +1145,40 @@ class VectorPdfTranslator:
 
     # ---------- 入口 ----------
     def run(self, src: str, dst: str) -> None:
+        import time
         doc = fitz.open(src)
         n_pages = doc.page_count
-        total = 0
+
+        # 先统计总 block 数量，用于预估时间
+        total_blocks = 0
         for page in doc:
-            # rotation != 0 的页：清零 rotation，让 dict 坐标和 insert_text 坐标系一致；
-            # 不恢复 rotation，输出就是字正的（页面可能变纵向，但字方向对）。
             if page.rotation:
                 page.set_rotation(0)
-            total += self.translate_page(page)
+            raw = self._collect_blocks(page)
+            blocks = self._merge_blocks(raw)
+            total_blocks += len(blocks)
+        print(f"[INFO] 共 {n_pages} 页 / {total_blocks} 个段落")
+
+        # 预估时间（秒/段落，粗略估计）
+        est_per_block = 1.5  # qwen 默认
+        total_est = total_blocks * est_per_block
+        print(f"[INFO] 预估时间：约 {total_est:.0f} 秒")
+
+        total = 0
+        t0 = time.time()
+        for i, page in enumerate(doc, 1):
+            n_blocks = self.translate_page(page)
+            total += n_blocks
+            elapsed = time.time() - t0
+            if i < n_pages:
+                avg = elapsed / i
+                remaining = avg * (n_pages - i)
+                print(f"[PROGRESS] 第 {i}/{n_pages} 页 / 剩余约 {remaining:.0f} 秒")
+            else:
+                print(f"[PROGRESS] 第 {i}/{n_pages} 页 / 完成")
         doc.save(dst, garbage=3, deflate=True)
         doc.close()
-        print(f"[OK] {src} → {dst}  共 {n_pages} 页 / 写入 {total} 行译文")
+        print(f"[OK] {src} → {dst}  共 {n_pages} 页 / 写入 {total} 行译文 / 耗时 {time.time()-t0:.1f} 秒")
 
 
 # --------------------------------------------------------------------------- #

@@ -1,5 +1,5 @@
 """
-app.py — Gradio 界面版 PDF 翻译 v0.5.3
+app.py — Gradio 界面版 PDF 翻译 v0.5.4
 拖入 PDF → 选引擎 → 出译文 PDF。
 
 跑：
@@ -13,9 +13,9 @@ import tempfile
 
 import gradio as gr
 
-# 动态加载 demo_v0.5.3.py（文件名带点，不能直接 import）
+# 动态加载 demo_v0.5.4.py（文件名带点，不能直接 import）
 _spec = importlib.util.spec_from_file_location(
-    "engine", os.path.join(os.path.dirname(__file__), "demo_v0.5.3.py")
+    "engine", os.path.join(os.path.dirname(__file__), "demo_v0.5.4.py")
 )
 _engine_mod = importlib.util.module_from_spec(_spec)
 sys.modules["engine"] = _engine_mod
@@ -68,8 +68,8 @@ def on_engine_change(engine: str):
         return gr.update(visible=False), gr.update(visible=False)
 
 
-with gr.Blocks(title="PDF 排版保留翻译 v0.5.3") as demo:
-    gr.Markdown("# PDF 排版保留翻译 v0.5.3\n矢量型 PDF，保住多栏 / 粗体 / 色块 / 图片背景。")
+with gr.Blocks(title="PDF 排版保留翻译 v0.5.4") as demo:
+    gr.Markdown("# PDF 排版保留翻译 v0.5.4\n矢量型 PDF，保住多栏 / 粗体 / 色块 / 图片背景。")
     with gr.Row():
         pdf_in = gr.File(label="上传 PDF", file_types=[".pdf"])
         engine = gr.Radio(
