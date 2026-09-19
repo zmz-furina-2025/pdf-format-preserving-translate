@@ -1146,7 +1146,7 @@ class VectorPdfTranslator:
         return n_written
 
     # ---------- 入口 ----------
-    def run(self, src: str, dst: str) -> None:
+    def run(self, src: str, dst: str, progress_callback=None) -> None:
         import time
         doc = fitz.open(src)
         n_pages = doc.page_count
@@ -1160,11 +1160,15 @@ class VectorPdfTranslator:
             blocks = self._merge_blocks(raw)
             total_blocks += len(blocks)
         print(f"[INFO] 共 {n_pages} 页 / {total_blocks} 个段落")
+        if progress_callback:
+            progress_callback(f"共 {n_pages} 页 / {total_blocks} 个段落")
 
         # 预估时间（秒/段落，粗略估计）
         est_per_block = 1.5  # qwen 默认
         total_est = total_blocks * est_per_block
         print(f"[INFO] 预估时间：约 {total_est:.0f} 秒")
+        if progress_callback:
+            progress_callback(f"共 {n_pages} 页 / {total_blocks} 个段落\n预估时间：约 {total_est:.0f} 秒")
 
         total = 0
         t0 = time.time()
@@ -1175,12 +1179,18 @@ class VectorPdfTranslator:
             if i < n_pages:
                 avg = elapsed / i
                 remaining = avg * (n_pages - i)
-                print(f"[PROGRESS] 第 {i}/{n_pages} 页 / 剩余约 {remaining:.0f} 秒")
+                msg = f"第 {i}/{n_pages} 页 / 剩余约 {remaining:.0f} 秒"
             else:
-                print(f"[PROGRESS] 第 {i}/{n_pages} 页 / 完成")
+                msg = f"第 {i}/{n_pages} 页 / 完成"
+            print(f"[PROGRESS] {msg}")
+            if progress_callback:
+                progress_callback(f"共 {n_pages} 页 / {total_blocks} 个段落\n预估时间：约 {total_est:.0f} 秒\n{msg}")
         doc.save(dst, garbage=3, deflate=True)
         doc.close()
-        print(f"[OK] {src} → {dst}  共 {n_pages} 页 / 写入 {total} 行译文 / 耗时 {time.time()-t0:.1f} 秒")
+        final_msg = f"完成！共 {n_pages} 页 / 写入 {total} 行译文 / 耗时 {time.time()-t0:.1f} 秒"
+        print(f"[OK] {src} → {dst}  {final_msg}")
+        if progress_callback:
+            progress_callback(final_msg)
 
 
 # --------------------------------------------------------------------------- #

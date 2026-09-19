@@ -13,6 +13,28 @@ import tempfile
 
 import gradio as gr
 
+# ---- 读 .env 文件 ----
+def load_env():
+    env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+    env = {}
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    env[k.strip()] = v.strip()
+    return env
+
+def save_env(secret_id, secret_key):
+    env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.write(f"TENCENT_SECRET_ID={secret_id}\n")
+        f.write(f"TENCENT_SECRET_KEY={secret_key}\n")
+        f.write(f"TENCENT_REGION=ap-shanghai\n")
+
+_env = load_env()
+
 # 动态加载 demo_v0.5.4.py（文件名带点，不能直接 import）
 _spec = importlib.util.spec_from_file_location(
     "engine", os.path.join(os.path.dirname(__file__), "demo_v0.5.4.py")
@@ -30,32 +52,62 @@ VectorPdfTranslator = _engine_mod.VectorPdfTranslator
 def translate_pdf(pdf_file, engine: str, use_cache: bool, use_layout_ai: bool, render_math: bool,
                   secret_id: str, secret_key: str,
                   qwen_host: str, qwen_model: str):
+    import queue
+    import threading
+
     if pdf_file is None:
-        return None, "请先上传 PDF"
-    print(f"[DEBUG] engine={engine!r}, qwen_model={qwen_model!r}")
+        yield None, "请先上传 PDF"
+        return
+
     src = pdf_file.name
     tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
     dst = tmp.name
     tmp.close()
-    try:
-        if engine == "tencent":
-            if not secret_id or not secret_key:
-                return None, "请先填 SecretId 和 SecretKey"
-            fn = TencentTranslator("en", "zh", secret_id=secret_id, secret_key=secret_key).translate_batch
-        elif engine == "qwen":
-            fn = QwenTranslator("en", "zh", host=qwen_host, model=qwen_model).translate_batch
-        else:
-            fn = MockTranslator().translate_batch
-        tr = VectorPdfTranslator(
-            fn, target_lang="zh",
-            use_cache=use_cache,
-            use_layout_ai=use_layout_ai,
-            render_math=render_math,
-        )
-        tr.run(src, dst)
-        return dst, "翻译完成"
-    except Exception as e:
-        return None, f"出错：{e}"
+
+    q = queue.Queue()
+
+    def worker():
+        try:
+            if engine == "tencent":
+                if not secret_id or not secret_key:
+                    q.put(("error", "请先填 SecretId 和 SecretKey"))
+                    return
+                # 存到 .env
+                save_env(secret_id, secret_key)
+                fn = TencentTranslator("en", "zh", secret_id=secret_id, secret_key=secret_key).translate_batch
+            elif engine == "qwen":
+                fn = QwenTranslator("en", "zh", host=qwen_host, model=qwen_model).translate_batch
+            else:
+                fn = MockTranslator().translate_batch
+            tr = VectorPdfTranslator(
+                fn, target_lang="zh",
+                use_cache=use_cache,
+                use_layout_ai=use_layout_ai,
+                render_math=render_math,
+            )
+            def cb(msg):
+                q.put(("progress", msg))
+            tr.run(src, dst, progress_callback=cb)
+            q.put(("done", dst))
+        except Exception as e:
+            q.put(("error", f"出错：{e}"))
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+
+    while True:
+        try:
+            kind, msg = q.get(timeout=0.5)
+            if kind == "progress":
+                yield None, msg
+            elif kind == "done":
+                yield msg, "翻译完成"
+                break
+            elif kind == "error":
+                yield None, msg
+                break
+        except queue.Empty:
+            continue
 
 
 # ---- 引擎选择时显示/隐藏配置 ----
@@ -81,14 +133,16 @@ with gr.Blocks(title="PDF 排版保留翻译 v0.5.4") as demo:
     # ---- 云端 API 配置（选云端翻译 API 时显示）----
     with gr.Group(visible=False) as tencent_group:
         gr.Markdown("### 云端翻译 API 配置")
-        secret_id = gr.Textbox(label="SecretId", placeholder="腾讯云 SecretId")
-        secret_key = gr.Textbox(label="SecretKey", placeholder="腾讯云 SecretKey", type="password")
+        secret_id = gr.Textbox(label="SecretId", placeholder="腾讯云 SecretId",
+                               value=_env.get("TENCENT_SECRET_ID", ""))
+        secret_key = gr.Textbox(label="SecretKey", placeholder="腾讯云 SecretKey",
+                                type="password", value=_env.get("TENCENT_SECRET_KEY", ""))
         gr.Markdown(
             """
             **怎么拿密钥**：
             1. 去 [腾讯云控制台](https://console.cloud.tencent.com/cam/capi) 注册
             2. 开通「机器翻译」服务（新用户有免费额度）
-            3. 把 SecretId 和 SecretKey 填到上面
+            3. 把 SecretId 和 SecretKey 填到上面（会自动保存到 .env）
             """
         )
 
